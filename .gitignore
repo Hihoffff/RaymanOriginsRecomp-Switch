@@ -1,0 +1,29 @@
+# Build-артефакты
+build*/
+out/
+*.o
+*.nro
+*.elf
+
+# macOS
+.DS_Store
+
+# Приватные игровые данные и всё производное от них.
+# В репозитории НЕ должно быть: default.xex, *.ipk, локализаций, сейвов,
+# ключей, сгенерированного из игры кода, дампов и образов.
+private/*
+!private/.gitkeep
+!private/README.md
+
+# Тяжёлые toolchain-зависимости (скачиваются локально по инструкциям)
+tools/llvm/
+tools/rexglue/
+tools/XenonRecomp/
+
+__pycache__/
+
+# клон upstream (не вендорим в наш git)
+upstream/
+
+# NVK-пакет для Switch (результат внешней сборки mesa-switch, не коммитим)
+switch/nvk-switch/

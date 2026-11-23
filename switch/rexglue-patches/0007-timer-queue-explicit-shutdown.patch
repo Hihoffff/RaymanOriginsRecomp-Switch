@@ -1,0 +1,63 @@
+From 2ec0886dafd557bea5f7441e0ad8cb9545e8d904 Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 21:13:44 +0300
+Subject: [PATCH] TimerQueue: explicit idempotent Shutdown (Switch: stop
+ dispatch thread before NRO unmap)
+
+---
+ include/rex/thread/timer_queue.h |  4 ++++
+ src/core/timer_queue.cpp         | 16 ++++++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/include/rex/thread/timer_queue.h b/include/rex/thread/timer_queue.h
+index b1f9ab7..fd59c01 100644
+--- a/include/rex/thread/timer_queue.h
++++ b/include/rex/thread/timer_queue.h
+@@ -63,6 +63,10 @@ struct TimerQueueWaitItem {
+   std::atomic<State> state_;
+ };
+ 
++// Stop and join the timer dispatch thread now (idempotent). Call before the
++// process image can disappear (e.g. before main() returns on Switch).
++void ShutdownTimerQueue();
++
+ std::weak_ptr<TimerQueueWaitItem> QueueTimerOnce(std::function<void(void*)> callback,
+                                                  void* userdata,
+                                                  TimerQueueWaitItem::clock::time_point due);
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 4dea64f..5fde146 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -97,6 +97,18 @@ class TimerQueue {
+         rex_jthread([this](rex_stop_token stop_token) { TimerThreadMain(stop_token); });
+   }
+ 
++  // Explicit, idempotent stop + join. Needed on Horizon (Switch): hbloader
++  // unmaps the NRO right after main() returns, so a still-running dispatch
++  // thread would execute unmapped code (crash 2168-0001 at exit).
++  void Shutdown() {
++    dispatch_thread_.request_stop();
++    auto wait_item = std::make_shared<WaitItem>(nullptr, nullptr, this, clock::time_point::min(),
++                                                clock::duration::zero());
++    wait_item->Disarm();
++    QueueTimer(std::move(wait_item));
++    dispatch_thread_ = rex_jthread();  // move-assign joins the old thread
++  }
++
+   ~TimerQueue() {
+     dispatch_thread_.request_stop();
+ 
+@@ -208,6 +220,10 @@ class TimerQueue {
+ 
+ rex::thread::TimerQueue timer_queue_;
+ 
++void ShutdownTimerQueue() {
++  timer_queue_.Shutdown();
++}
++
+ void TimerQueueWaitItem::Disarm() {
+   State state;
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,68 @@
+From 04c8f72232b6b8acd231dca976657526044f2774 Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 16:49:24 +0300
+Subject: [PATCH] Switch: skip GPU plugins and host tools, complete net stubs
+
+GPU plugins are dlopen()ed and Horizon has no dynamic loading; they and the
+codegen/CLI host tools are not built for Switch (static GPU path is TODO).
+xam_net_switch: add NetDll_shutdown/select stubs.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                    | 13 ++++++++++---
+ src/kernel/xam/xam_net_switch.cpp |  6 ++++++
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1483552..40e2b96 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -278,11 +278,18 @@ add_subdirectory(src/filesystem)
+ add_subdirectory(src/ui)
+ add_subdirectory(src/input)
+ add_subdirectory(src/audio)
+-add_subdirectory(src/graphics)
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    # GPU plugins are dlopen()ed at runtime (gpu_plugin_loader.cpp); Horizon
++    # has no dynamic loading, so Switch needs a statically linked GPU path
++    # (TODO: stage 3 of the Switch plan). Codegen/CLI are host-only tools.
++    add_subdirectory(src/graphics)
++endif()
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+-add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    add_subdirectory(src/codegen)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
+diff --git a/src/kernel/xam/xam_net_switch.cpp b/src/kernel/xam/xam_net_switch.cpp
+index d3e7846..8eb8ad7 100644
+--- a/src/kernel/xam/xam_net_switch.cpp
++++ b/src/kernel/xam/xam_net_switch.cpp
+@@ -180,6 +180,7 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+   return kInvalidSocket;
+ }
+ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) { return NetFail(kWSANetDown); }
++u32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, u32 how) { return NetFail(kWSANetDown); }
+ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
+                             mapped_void optval_ptr, u32 optlen) {
+   return NetFail(kWSANetDown);
+@@ -229,6 +230,11 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+                            ppc_ptr_t<XWSAOVERLAPPED> overlapped, mapped_void completion_routine) {
+   return NetFail(kWSANetDown);
+ }
++i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
++                        ppc_ptr_t<x_fd_set> writefds, ppc_ptr_t<x_fd_set> exceptfds,
++                        mapped_void timeout_ptr) {
++  return static_cast<i32>(NetFail(kWSANetDown));
++}
+ u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) { return 0; }
+ 
+ }  // namespace xam
+-- 
+2.54.0
+

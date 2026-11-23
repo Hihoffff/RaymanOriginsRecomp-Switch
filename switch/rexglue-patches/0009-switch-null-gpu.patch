@@ -1,0 +1,267 @@
+From 353d0b7f4df19fa397357163b58515a4f089172b Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 22:40:31 +0300
+Subject: [PATCH] Switch: statically linked null GPU (no dlopen on Horizon)
+
+GraphicsSystem + CommandProcessor compiled statically as rexgpu-null-switch
+(register_file, xenos, null/null_gpu_switch.cpp); the Vulkan/D3D12 plugin
+targets stay host-only. CommandProcessor has no GPU-API dependency, only the
+plugin backends do.
+
+null_gpu::CreateStaticNullGraphicsSystem() (include/rex/graphics/null_gpu.h)
+builds a GraphicsSystem without any provider: ring buffer, fences, event
+writes, interrupt callback and the vblank worker stay alive, nothing is
+drawn. REXGPU_INFO bring-up markers: creation, ring buffer setup, read-pointer
+writeback, first primary buffer batch, first vblank, first interrupt dispatch
+(the last three are one-time logs in shared code).
+---
+ CMakeLists.txt                        | 11 ++--
+ include/rex/graphics/null_gpu.h       | 26 +++++++++
+ src/graphics/CMakeLists.txt           | 31 +++++++++++
+ src/graphics/command_processor.cpp    |  7 +++
+ src/graphics/graphics_system.cpp      | 10 ++++
+ src/graphics/null/null_gpu_switch.cpp | 78 +++++++++++++++++++++++++++
+ 6 files changed, 157 insertions(+), 6 deletions(-)
+ create mode 100644 include/rex/graphics/null_gpu.h
+ create mode 100644 src/graphics/null/null_gpu_switch.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 40e2b96..41b3823 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -278,12 +278,11 @@ add_subdirectory(src/filesystem)
+ add_subdirectory(src/ui)
+ add_subdirectory(src/input)
+ add_subdirectory(src/audio)
+-if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+-    # GPU plugins are dlopen()ed at runtime (gpu_plugin_loader.cpp); Horizon
+-    # has no dynamic loading, so Switch needs a statically linked GPU path
+-    # (TODO: stage 3 of the Switch plan). Codegen/CLI are host-only tools.
+-    add_subdirectory(src/graphics)
+-endif()
++# GPU backends are dlopen()ed plugins (gpu_plugin_loader.cpp) everywhere
++# except Nintendo Switch: Horizon has no dynamic loading, so src/graphics
++# builds a statically linked null GPU there instead (stage 3 of the Switch
++# plan). Codegen/CLI remain host-only tools.
++add_subdirectory(src/graphics)
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+ if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+diff --git a/include/rex/graphics/null_gpu.h b/include/rex/graphics/null_gpu.h
+new file mode 100644
+index 0000000..42d8c55
+--- /dev/null
++++ b/include/rex/graphics/null_gpu.h
+@@ -0,0 +1,26 @@
++/**
++ * @file        graphics/null_gpu.h
++ * @brief       Statically linked null GPU (Nintendo Switch)
++ *
++ * Horizon has no dlopen(), so the rexgpu-null plugin cannot be loaded at
++ * runtime. This factory builds the same kind of GraphicsSystem (command
++ * stream processing without drawing) for static linking.
++ *
++ * @license     BSD 3-Clause License (same as ReXGlue)
++ */
++
++#pragma once
++
++#include <memory>
++
++namespace rex::system {
++class IGraphicsSystem;
++}
++
++namespace rex::graphics::null_gpu {
++
++// Null GPU: keeps the guest GPU protocol alive (ring buffer, fences, event
++// writes, interrupts, vblank) but draws nothing and needs no Vulkan/window.
++std::unique_ptr<rex::system::IGraphicsSystem> CreateStaticNullGraphicsSystem();
++
++}  // namespace rex::graphics::null_gpu
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 2bbe9ea..5210b3e 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -3,6 +3,35 @@
+ #
+ # Runtime-loaded via rex::system::LoadGpuPlugin; consumers never link this
+ # target. The Xenos format layer is compiled into rexcore.
++#
++# Nintendo Switch: no dlopen() on Horizon, so plugins are skipped and a
++# statically linked null GPU (protocol only, no drawing) is built instead.
++
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++
++# Statically linked null GPU for the Switch bring-up. Only the protocol core
++# (GraphicsSystem + CommandProcessor) is compiled; CommandProcessor itself
++# has no Vulkan/D3D12 dependency (only the plugin backends do).
++add_library(rexgpu-null-switch STATIC
++    graphics_system.cpp
++    command_processor.cpp
++    register_file.cpp
++    xenos.cpp
++    null/null_gpu_switch.cpp
++)
++add_library(rex::gpu-null-switch ALIAS rexgpu-null-switch)
++
++set_target_properties(rexgpu-null-switch PROPERTIES
++    EXPORT_NAME gpu-null-switch
++    CXX_VISIBILITY_PRESET hidden
++    VISIBILITY_INLINES_HIDDEN ON
++)
++
++target_compile_options(rexgpu-null-switch PRIVATE -Wno-unused-variable)
++
++target_link_libraries(rexgpu-null-switch PRIVATE rexruntime)
++
++else()  # NintendoSwitch
+ 
+ set(REXGPU_XENOS_SOURCES
+     plugin_main.cpp
+@@ -185,3 +214,5 @@ endif()
+ if(REXGLUE_USE_D3D12)
+     target_link_libraries(rexgpu-null PRIVATE d3d12 dxgi dxguid)
+ endif()
++
++endif()  # NintendoSwitch
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..260c759 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -13,6 +13,7 @@
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
++#include <mutex>
+ #include <string_view>
+ 
+ #include <fmt/format.h>
+@@ -615,6 +616,12 @@ void CommandProcessor::ReturnFromWait() {}
+ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+   SCOPE_profile_cpu_f("gpu");
+ 
++  // One-time bring-up marker: the guest is feeding the ring buffer.
++  static std::once_flag first_primary_buffer_once;
++  std::call_once(first_primary_buffer_once, [] {
++    REXGPU_INFO("GPU: executing first primary ring buffer batch");
++  });
++
+   // Execute commands!
+   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+   reader.set_read_offset(read_index * sizeof(uint32_t));
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..6933798 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -299,6 +299,12 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+     return;
+   }
+ 
++  // One-time bring-up marker: the guest interrupt callback is being invoked.
++  static std::once_flag first_interrupt_once;
++  std::call_once(first_interrupt_once, [this] {
++    REXGPU_INFO("GPU: first interrupt dispatch to guest callback {:08X}", interrupt_callback_);
++  });
++
+   auto thread = system::XThread::GetCurrentThread();
+   assert_not_null(thread);
+ 
+@@ -320,6 +326,10 @@ void GraphicsSystem::MarkVblank() {
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+ 
++  // One-time bring-up marker: the vsync worker is ticking.
++  static std::once_flag first_vblank_once;
++  std::call_once(first_vblank_once, [] { REXGPU_INFO("GPU: first vblank"); });
++
+   // Increment vblank counter (so the game sees us making progress).
+   if (command_processor_) {
+     command_processor_->increment_counter();
+diff --git a/src/graphics/null/null_gpu_switch.cpp b/src/graphics/null/null_gpu_switch.cpp
+new file mode 100644
+index 0000000..162a194
+--- /dev/null
++++ b/src/graphics/null/null_gpu_switch.cpp
+@@ -0,0 +1,78 @@
++/**
++ * @file        graphics/null/null_gpu_switch.cpp
++ * @brief       Statically linked null GPU for Nintendo Switch.
++ *
++ * Same role as the rexgpu-null plugin (null_gpu.cpp): keeps the guest's GPU
++ * protocol alive (ring buffer, fences, event writes, interrupts, vblank) but
++ * draws nothing. Unlike the plugin it creates no Vulkan provider - Horizon
++ * has neither dlopen() nor a Vulkan driver here.
++ *
++ * Log markers (REXGPU_INFO) let a hardware run be checked without a debugger:
++ * creation, ring buffer setup, read-pointer writeback, first packet, first
++ * vblank, first interrupt dispatch.
++ *
++ * @license     BSD 3-Clause License (same as ReXGlue)
++ */
++
++#include <rex/graphics/null_gpu.h>
++
++#include <memory>
++#include <string>
++
++#include <rex/graphics/command_processor.h>
++#include <rex/graphics/graphics_system.h>
++#include <rex/logging.h>
++
++namespace rex::graphics::null_gpu {
++
++class SwitchNullCommandProcessor : public CommandProcessor {
++ public:
++  SwitchNullCommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state)
++      : CommandProcessor(graphics_system, kernel_state) {}
++
++  void IssueSwap(uint32_t, uint32_t, uint32_t) override {}
++
++ protected:
++  bool SetupContext() override { return true; }
++  void ShutdownContext() override {}
++  Shader* LoadShader(xenos::ShaderType, uint32_t, const uint32_t*, uint32_t) override {
++    return nullptr;
++  }
++  bool IssueDraw(xenos::PrimitiveType, uint32_t, IndexBufferInfo*, bool) override { return true; }
++  bool IssueCopy() override { return true; }
++};
++
++class SwitchNullGraphicsSystem : public GraphicsSystem {
++ public:
++  std::string name() const override { return "Null (Switch, static)"; }
++
++  // No window and no presenter on Horizon.
++  X_STATUS SetupPresentation(::rex::ui::WindowedAppContext*) override { return X_STATUS_SUCCESS; }
++
++  void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) override {
++    REXGPU_INFO("null-gpu: ring buffer at 0x{:08X}, size 2^{}", ptr, size_log2);
++    GraphicsSystem::InitializeRingBuffer(ptr, size_log2);
++  }
++
++  void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override {
++    REXGPU_INFO("null-gpu: read-pointer writeback at 0x{:08X}, block size 2^{}", ptr,
++                block_size_log2);
++    GraphicsSystem::EnableReadPointerWriteBack(ptr, block_size_log2);
++  }
++
++ protected:
++  // Headless: no provider at all (no Vulkan on Horizon in this build).
++  void CreateProvider(bool with_presentation) override {}
++
++  std::unique_ptr<CommandProcessor> CreateCommandProcessor() override {
++    REXGPU_INFO("null-gpu: command processor created (protocol only, no drawing)");
++    return std::make_unique<SwitchNullCommandProcessor>(this, kernel_state_);
++  }
++};
++
++std::unique_ptr<system::IGraphicsSystem> CreateStaticNullGraphicsSystem() {
++  REXGPU_INFO("null-gpu: static null GPU system created");
++  return std::make_unique<SwitchNullGraphicsSystem>();
++}
++
++}  // namespace rex::graphics::null_gpu
+-- 
+2.54.0
+

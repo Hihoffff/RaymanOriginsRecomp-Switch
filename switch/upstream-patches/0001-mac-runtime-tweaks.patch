@@ -1,0 +1,187 @@
+diff --git a/rex/run.sh b/rex/run.sh
+index 252b3ef..f80f396 100644
+--- a/rex/run.sh
++++ b/rex/run.sh
+@@ -18,9 +18,11 @@ for lib in librexgpu-xenos.dylib libvulkan.1.dylib libMoltenVK.dylib; do
+     [ -f "$BUILD/$lib" ] || cp "$SDK/lib/$lib" "$BUILD/"
+ done
+ 
+-export VK_DRIVER_FILES="$SDK/share/vulkan/icd.d/MoltenVK_icd.json"
++# MoltenVK 1.4.1 do SDK dá janela preta no macOS novo; usa o 1.4.2.
++export VK_DRIVER_FILES="$P/tools/moltenvk/MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json"
+ exec "$BUILD/rayman" \
+     --game_data_root="$P/private/game" \
+     --gpu_plugin=xenos \
+     --mnk_mode=true \
++    --vsync=true \
+     "$@"
+diff --git a/rex/run_native.sh b/rex/run_native.sh
+index 4b6f0c5..18167b9 100755
+--- a/rex/run_native.sh
++++ b/rex/run_native.sh
+@@ -12,7 +12,7 @@ set -e
+ R=$(cd "$(dirname "$0")" && pwd)
+ P=$R/..
+ SDK=$P/tools/rexglue/mac-arm64
+-BUILD=$R/out/build/mac-arm64-release
++BUILD=${BUILD:-$R/out/build/mac-arm64-release}
+ 
+ for lib in libvulkan.1.dylib libMoltenVK.dylib; do
+     [ -f "$BUILD/$lib" ] || cp "$SDK/lib/$lib" "$BUILD/"
+@@ -23,7 +23,7 @@ if [ ! -f "$BUILD/librexgpu-null.dylib" ]; then
+ fi
+ 
+ cd "$R"
+-export VK_DRIVER_FILES="$SDK/share/vulkan/icd.d/MoltenVK_icd.json"
++export VK_DRIVER_FILES="$P/tools/moltenvk/MoltenVK/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json"
+ export MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=1
+ export RAYMAN_NATIVE_RENDER=main
+ export RAYMAN_NATIVE_SPIRV="${RAYMAN_NATIVE_SPIRV:-$P/private/native/spirv_ubo}"
+diff --git a/rex/src/hooks.cpp b/rex/src/hooks.cpp
+index b945ff8..8626596 100644
+--- a/rex/src/hooks.cpp
++++ b/rex/src/hooks.cpp
+@@ -36,7 +36,7 @@ void RaymanAudioDump(PPCRegister& r4) {
+ }
+ 
+ // ---- Frame pacing ----
+-// sub_826D41B8 is the game's D3D Present (the only path to VdSwap, see
++// sub_826D5E38 is the game's D3D Present (the only path to VdSwap, see
+ // docs/PROGRESS.md section 7). Wrapping it gives the real game frame rate,
+ // logged every 2 s: average FPS and the slowest frame.
+ #include <rex/hook.h>
+@@ -51,18 +51,18 @@ void RaymanAudioDump(PPCRegister& r4) {
+ #define RAYMAN_LOG(...) (std::fprintf(stderr, __VA_ARGS__), std::fputc('\n', stderr))
+ #endif
+ 
+-REX_EXTERN(__imp__sub_826D41B8);
++REX_EXTERN(__imp__sub_826D5E38);
+ void RaymanNativeCaptureFrame();     // native_capture.cpp
+ void RaymanNativeRendererPresent();  // native_renderer.cpp
+ void RaymanAutopilotFrame();         // autopilot.cpp
+ void RaymanTouchGameRunning();       // android_touch.cpp
+ 
+-REX_HOOK_RAW(sub_826D41B8) {
++REX_HOOK_RAW(sub_826D5E38) {
+   using clock = std::chrono::steady_clock;
+   static clock::time_point window_start = clock::now(), last = window_start;
+   static int frames = 0;
+   static double worst_ms = 0;
+-  __imp__sub_826D41B8(ctx, base);
++  __imp__sub_826D5E38(ctx, base);
+   // Frame limiter: the game's logic advances once per presented frame, so a
+   // 120 Hz display (Galaxy S23, ProMotion Macs) would run it twice as fast.
+   // RAYMAN_FPS_LIMIT overrides the default of 60 (0 disables it).
+diff --git a/rex/src/native_capture.cpp b/rex/src/native_capture.cpp
+index 2035a76..fb417f8 100644
+--- a/rex/src/native_capture.cpp
++++ b/rex/src/native_capture.cpp
+@@ -66,7 +66,7 @@ struct ShaderInfo {
+ };
+ 
+ struct DrawKey {
+-  int entry;          // 0 = DrawIndexed (826D7588), 1 = Draw (826D7170), 2 = DrawVerticesUP (826D7128)
++  int entry;          // 0 = DrawIndexed (826D9208), 1 = Draw (826D8DF0), 2 = DrawVerticesUP (826D8DA8)
+   uint32_t primitive;
+   uint64_t vs, ps;
+   bool operator<(const DrawKey& o) const {
+@@ -365,53 +365,53 @@ void RaymanNativeCaptureFrame() {
+   g_unknownShaderDraws = 0;
+ }
+ 
+-REX_EXTERN(__imp__sub_826CD850);  // CreateVertexShader(function) -> shader
+-REX_EXTERN(__imp__sub_826CD668);  // CreatePixelShader(function) -> shader
+-REX_EXTERN(__imp__sub_826D7588);  // DrawIndexed
+-REX_EXTERN(__imp__sub_826D7170);  // Draw
+-REX_EXTERN(__imp__sub_826D7128);  // DrawVerticesUP(prim, vertexCount, data, stride)
+-REX_EXTERN(__imp__sub_826D9588);  // Resolve
+-REX_EXTERN(__imp__sub_826D6B98);  // Clear
++REX_EXTERN(__imp__sub_826CF4D0);  // CreateVertexShader(function) -> shader
++REX_EXTERN(__imp__sub_826CF2E8);  // CreatePixelShader(function) -> shader
++REX_EXTERN(__imp__sub_826D9208);  // DrawIndexed
++REX_EXTERN(__imp__sub_826D8DF0);  // Draw
++REX_EXTERN(__imp__sub_826D8DA8);  // DrawVerticesUP(prim, vertexCount, data, stride)
++REX_EXTERN(__imp__sub_826DB208);  // Resolve
++REX_EXTERN(__imp__sub_826D8818);  // Clear
+ 
+-REX_HOOK_RAW(sub_826CD850) {
++REX_HOOK_RAW(sub_826CF4D0) {
+   uint32_t function = ctx.r3.u32;
+-  __imp__sub_826CD850(ctx, base);
++  __imp__sub_826CF4D0(ctx, base);
+   if (Enabled()) {
+     RecordShader(ctx.r3.u32, function, true);
+   }
+ }
+ 
+-REX_HOOK_RAW(sub_826CD668) {
++REX_HOOK_RAW(sub_826CF2E8) {
+   uint32_t function = ctx.r3.u32;
+-  __imp__sub_826CD668(ctx, base);
++  __imp__sub_826CF2E8(ctx, base);
+   if (Enabled()) {
+     RecordShader(ctx.r3.u32, function, false);
+   }
+ }
+ 
+-REX_HOOK_RAW(sub_826D7588) {
++REX_HOOK_RAW(sub_826D9208) {
+   if (Enabled()) {
+     RecordDraw(0, ctx);
+   }
+   uint32_t device = ctx.r3.u32;
+-  __imp__sub_826D7588(ctx, base);
++  __imp__sub_826D9208(ctx, base);
+   if (Enabled()) LogVertexFetches(device);
+ }
+ 
+-REX_HOOK_RAW(sub_826D7170) {
++REX_HOOK_RAW(sub_826D8DF0) {
+   if (Enabled()) {
+     RecordDraw(1, ctx);
+   }
+-  __imp__sub_826D7170(ctx, base);
++  __imp__sub_826D8DF0(ctx, base);
+ }
+ 
+ // Not BeginVertices (826D6C68): it only reserves command-buffer space, and the
+ // caller copies the vertices after it returns. The public wrapper has them.
+-REX_HOOK_RAW(sub_826D7128) {
++REX_HOOK_RAW(sub_826D8DA8) {
+   if (Enabled()) {
+     RecordDraw(2, ctx);
+   }
+-  __imp__sub_826D7128(ctx, base);
++  __imp__sub_826D8DA8(ctx, base);
+ }
+ 
+ // Render-target traffic, logged with RAYMAN_NATIVE_CAPTURE (frames multiple of 120).
+@@ -425,7 +425,7 @@ REX_HOOK_RAW(sub_826D7128) {
+ // RB_COLOR_INFO at device + 0x2880 / 0x2884.
+ constexpr uint32_t kTextureFetch = 0x1C;
+ 
+-REX_HOOK_RAW(sub_826D9588) {
++REX_HOOK_RAW(sub_826DB208) {
+   if (Enabled()) {
+     uint32_t device = ctx.r3.u32, flags = ctx.r4.u32, rect = ctx.r5.u32, tex = ctx.r6.u32;
+     // Color resolves only (bit 2: depth/stencil), into a texture.
+@@ -445,10 +445,10 @@ REX_HOOK_RAW(sub_826D9588) {
+                 f1 & 0xFFFFF000, (f2 & 0x1FFF) + 1, ((f2 >> 13) & 0x1FFF) + 1, LoadBE32(device + 0x2880),
+                 LoadBE32(device + 0x2884));
+   }
+-  __imp__sub_826D9588(ctx, base);
++  __imp__sub_826DB208(ctx, base);
+ }
+ 
+-REX_HOOK_RAW(sub_826D6B98) {
++REX_HOOK_RAW(sub_826D8818) {
+   // Clear(device, count, rects, flags, color, z, stencil): bit 0 of flags = color.
+   if (Enabled() && (ctx.r6.u32 & 1)) {
+     RaymanNativeRendererClear(g_rayman_membase + ctx.r3.u32 + native::kStateBegin, ctx.r7.u32);
+@@ -458,5 +458,5 @@ REX_HOOK_RAW(sub_826D6B98) {
+     CAPTURE_LOG("clear count %u flags %X color %08X z %g surface %08X color %08X", ctx.r4.u32, ctx.r6.u32,
+                 ctx.r7.u32, ctx.f1.f64, LoadBE32(device + 0x2880), LoadBE32(device + 0x2884));
+   }
+-  __imp__sub_826D6B98(ctx, base);
++  __imp__sub_826D8818(ctx, base);
+ }

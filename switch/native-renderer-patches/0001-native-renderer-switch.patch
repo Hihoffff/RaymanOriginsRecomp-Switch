@@ -1,0 +1,137 @@
+diff --git a/tools/native_renderer/vk_renderer.h b/tools/native_renderer/vk_renderer.h
+index 821da3b..53f198f 100644
+--- a/tools/native_renderer/vk_renderer.h
++++ b/tools/native_renderer/vk_renderer.h
+@@ -785,11 +785,22 @@ class Renderer {
+     vkGetPhysicalDeviceFeatures(phys_, &have);
+     stage("device: features queried");
+     if (!have.shaderSampledImageArrayDynamicIndexing) return Fail("GPU lacks shaderSampledImageArrayDynamicIndexing");
++    if (props_.limits.maxPerStageDescriptorSampledImages >= 64 &&
++        props_.limits.maxPerStageDescriptorSampledImages < kMaxTextures + 2)
++      kMaxTextures = props_.limits.maxPerStageDescriptorSampledImages - 2;
+     if (props_.limits.maxBoundDescriptorSets < spirv::kSets ||
+         props_.limits.maxPerStageDescriptorSampledImages < kMaxTextures + 2)
+-      return Fail("GPU descriptor limits too low");
++      return Fail("GPU descriptor limits too low: sets " + std::to_string(props_.limits.maxBoundDescriptorSets) + " (need " + std::to_string(spirv::kSets) + "), sampled images/stage " + std::to_string(props_.limits.maxPerStageDescriptorSampledImages) + " (need " + std::to_string(kMaxTextures + 2) + ")");
+     VkPhysicalDeviceFeatures want{};
+     want.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
++    // DXT textures stay compressed on GPUs that sample BC natively: no CPU
++    // decode, 4-8x less to upload. RAYMAN_NATIVE_NO_BC=1 forces the RGBA8 path.
++    if (have.textureCompressionBC && !std::getenv("RAYMAN_NATIVE_NO_BC")) {
++      want.textureCompressionBC = VK_TRUE;
++      bcTextures_ = true;
++    }
++    if (log) log(bcTextures_ ? "native renderer: DXT textures uploaded as BC (compressed)"
++                    : "native renderer: DXT textures decoded to RGBA8 on the CPU");
+     float priority = 1.0f;
+     VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+     queue.queueFamilyIndex = queueFamily_;
+@@ -873,7 +884,24 @@ class Renderer {
+     sc.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // filled by a blit
+     sc.preTransform = transform;
+     sc.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++    // RAYMAN_NATIVE_PRESENT=mailbox|immediate picks a non-blocking mode (the
++    // caller then paces frames itself); default FIFO.
+     sc.presentMode = VK_PRESENT_MODE_FIFO_KHR;
++    if (const char* want = std::getenv("RAYMAN_NATIVE_PRESENT")) {
++      uint32_t n = 0;
++      vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &n, nullptr);
++      std::vector<VkPresentModeKHR> modes(n);
++      vkGetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &n, modes.data());
++      std::string list;
++      for (auto m : modes) list += " " + std::to_string(int(m));
++      auto has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
++      if (!std::strcmp(want, "mailbox") && has(VK_PRESENT_MODE_MAILBOX_KHR)) sc.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
++      else if ((!std::strcmp(want, "mailbox") || !std::strcmp(want, "immediate")) && has(VK_PRESENT_MODE_IMMEDIATE_KHR))
++        sc.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
++      if (log) log(("present modes (0=immediate 1=mailbox 2=fifo):" + list + ", using " +
++                    std::to_string(int(sc.presentMode))).c_str());
++    }
++    presentMode_ = sc.presentMode;
+     sc.clipped = VK_TRUE;
+     if (vkCreateSwapchainKHR(device_, &sc, nullptr, &swapchain_) != VK_SUCCESS) return Fail("swapchain failed");
+     uint32_t images = 0;
+@@ -989,7 +1017,15 @@ class Renderer {
+     img = Image{};
+   }
+ 
+-  static constexpr uint32_t kMaxTextures = 1024, kMaxSamplers = 16;
++  static constexpr uint32_t kMaxSamplers = 16;
++  // Texture heap size: 1024, or less on GPUs with a smaller per-stage limit (MoltenVK: 256).
++  uint32_t kMaxTextures = 1024;
++  bool bcTextures_ = false;  // DXT kept compressed (textureCompressionBC)
++
++ public:
++  VkPresentModeKHR presentMode_ = VK_PRESENT_MODE_FIFO_KHR;
++
++ private:
+   // Descriptor sets (spirv_patch.h): 2D heap, 3D + cube, samplers, constants.
+   static constexpr uint32_t kTextureSet = 0, kVolumeCubeSet = 1, kSamplerSet = 2, kConstantSet = 3;
+ 
+@@ -1284,10 +1320,10 @@ class Renderer {
+   // Decodes the texture straight into the staging buffer and records its copy
+   // into the image. False (nothing recorded) if it doesn't decode or fit.
+   bool Upload(const Image& img, const xenos::TextureFetch& t, bool fresh) {
+-    size_t bytes = xenos::DecodedSize(t);
++    size_t bytes = xenos::UploadSize(t, bcTextures_);
+     size_t start = staging_.used;
+     size_t at = staging_.Alloc(bytes, 16);
+-    if (staging_.used > staging_.size || !xenos::DecodeTextureTo(memory_, t, staging_.map + at)) {
++    if (staging_.used > staging_.size || !xenos::DecodeTextureTo(memory_, t, staging_.map + at, bcTextures_)) {
+       staging_.used = start;
+       return false;
+     }
+@@ -1356,7 +1392,13 @@ class Renderer {
+     // k_8 stays one channel: R8 read through an RRRR swizzle, the same values
+     // as the four replicated channels at a quarter of the bytes.
+     bool r8 = xenos::DecodedBytesPerTexel(t.format) == 1;
+-    e.image = CreateImage(t.width, t.height, r8 ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8B8A8_UNORM,
++    VkFormat fmt = r8 ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
++    if (bcTextures_ && xenos::IsBlockFormat(t.format)) {
++      fmt = t.format == 0x12 ? VK_FORMAT_BC1_RGBA_UNORM_BLOCK
++          : t.format == 0x13 ? VK_FORMAT_BC2_UNORM_BLOCK
++                             : VK_FORMAT_BC3_UNORM_BLOCK;
++    }
++    e.image = CreateImage(t.width, t.height, fmt,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_VIEW_TYPE_2D,
+                           r8 ? VkComponentMapping{VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                                                   VK_COMPONENT_SWIZZLE_R}
+diff --git a/tools/native_renderer/xenos_texture.h b/tools/native_renderer/xenos_texture.h
+index 9de0b05..1264363 100644
+--- a/tools/native_renderer/xenos_texture.h
++++ b/tools/native_renderer/xenos_texture.h
+@@ -121,9 +121,22 @@ inline bool Supported(uint32_t format) {
+ inline uint32_t DecodedBytesPerTexel(uint32_t format) { return format == 0x02 ? 1 : 4; }
+ inline size_t DecodedSize(const TextureFetch& t) { return size_t(t.width) * t.height * DecodedBytesPerTexel(t.format); }
+ 
++// DXT1/3/5 (k_DXT1, k_DXT2_3, k_DXT4_5).
++inline bool IsBlockFormat(uint32_t format) { return format == 0x12 || format == 0x13 || format == 0x14; }
++
++// Bytes DecodeTextureTo writes. With keep_blocks, DXT stays compressed: the
++// untiled, endian-swapped 4x4 blocks are the standard BC1/BC2/BC3 layout.
++inline size_t UploadSize(const TextureFetch& t, bool keep_blocks) {
++  if (keep_blocks && IsBlockFormat(t.format)) {
++    return size_t((t.width + 3) / 4) * ((t.height + 3) / 4) * (t.format == 0x12 ? 8 : 16);
++  }
++  return DecodedSize(t);
++}
++
+ // Decodes the top mip of a 2D texture into `out` (DecodedSize bytes, tightly
+ // packed rows; R8 for k_8, RGBA8 otherwise).
+-inline bool DecodeTextureTo(const MemoryReader& memory, const TextureFetch& t, uint8_t* out) {
++inline bool DecodeTextureTo(const MemoryReader& memory, const TextureFetch& t, uint8_t* out,
++                            bool keep_blocks = false) {
+   bool block = t.format == 0x12 || t.format == 0x13 || t.format == 0x14;
+   uint32_t blockBytes = t.format == 0x12 ? 8 : block ? 16 : t.format == 0x06 ? 4 : t.format == 0x02 ? 1 : 0;
+   if (!blockBytes) return false;
+@@ -183,6 +196,10 @@ inline bool DecodeTextureTo(const MemoryReader& memory, const TextureFetch& t, u
+       uint8_t blk[16];
+       std::memcpy(blk, src + off, blockBytes);
+       Swap(blk, blockBytes, t.endian);
++      if (block && keep_blocks) {
++        std::memcpy(&out[(size_t(by) * bw + bx) * blockBytes], blk, blockBytes);
++        continue;
++      }
+       if (!block) {
+         // D3DFMT_A8R8G8B8 on k_8_8_8_8: after the 8in32 swap the bytes are B G R A.
+         uint8_t* o = &out[(size_t(by) * t.width + bx) * 4];

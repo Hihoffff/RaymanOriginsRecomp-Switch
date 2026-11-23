@@ -1,0 +1,196 @@
+From 9614f68f33502d49c03481ea2bd145b303608c19 Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Fri, 13 Nov 2026 22:05:16 +0300
+Subject: [PATCH] Switch: per-thread CPU report ([cpu]) and sampling profiler
+ ([prof], needs pch Guard), kstat off by default
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diag_sample.h             | 45 ++++++++++++++++++---------
+ src/graphics/null/null_gpu_switch.cpp |  4 +++
+ src/kernel/kstat.h                    | 38 +++++++++++++++++++---
+ src/system/xthread.cpp                | 34 ++++++++++++++++++++
+ 4 files changed, 103 insertions(+), 18 deletions(-)
+
+diff --git a/include/rex/diag_sample.h b/include/rex/diag_sample.h
+index 8390fe5..3c9f531 100644
+--- a/include/rex/diag_sample.h
++++ b/include/rex/diag_sample.h
+@@ -1,23 +1,40 @@
+-// Diagnostic (Switch bring-up): every guest function records its name in a
+-// per-thread slot on entry; kstat.h dumps the slots, which shows where each
+-// guest thread currently is (a poor man's sampling profiler).
++// Diagnostic sampling profiler (Switch bring-up). When the generated code is
++// built with REX_FUNC_PROLOGUE pushing a rex_diag::Guard, every guest function
++// pushes its name on a per-thread shadow stack (global, readable by other
++// threads). Sample() records the top of each stack; Dump() logs the hottest
++// functions per thread. Not thread-safe by design: racy reads are acceptable.
+ #pragma once
+ #include <atomic>
+ #include <cstdint>
+ namespace rex_diag {
+ uint32_t CurrentHandle();  // defined in xthread.cpp
+-struct Slots {
+-  const char* volatile fn[64];
+-  uint32_t h[64];
+-  std::atomic<int> n{0};
++constexpr int kDepth = 128;
++constexpr int kThreads = 64;
++struct Slot {
++  const char* volatile stack[kDepth];
++  volatile int depth;
++  uint32_t handle;
+ };
+-inline Slots g_slots;
+-inline thread_local int t_slot = -1;
+-inline void Mark(const char* f) {
+-  if (t_slot < 0) {
+-    t_slot = g_slots.n.fetch_add(1) % 64;
+-    g_slots.h[t_slot] = CurrentHandle();
++inline Slot g_slots[kThreads];
++inline std::atomic<int> g_count{0};
++inline thread_local Slot* t_slot = nullptr;
++inline Slot* MySlot() {
++  if (!t_slot) {
++    int i = g_count.fetch_add(1);
++    if (i >= kThreads) i = kThreads - 1;
++    t_slot = &g_slots[i];
++    t_slot->handle = CurrentHandle();
+   }
+-  g_slots.fn[t_slot] = f;
++  return t_slot;
+ }
++struct Guard {
++  Slot* s;
++  explicit Guard(const char* f) : s(MySlot()) {
++    int d = s->depth;
++    if (d >= 0 && d < kDepth) s->stack[d] = f;
++    s->depth = d + 1;
++  }
++  ~Guard() { s->depth = s->depth - 1; }
++};
++void Sample();  // xthread.cpp
+ }  // namespace rex_diag
+diff --git a/src/graphics/null/null_gpu_switch.cpp b/src/graphics/null/null_gpu_switch.cpp
+index 9deab1e..de25c8a 100644
+--- a/src/graphics/null/null_gpu_switch.cpp
++++ b/src/graphics/null/null_gpu_switch.cpp
+@@ -24,6 +24,8 @@
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/logging.h>
++#include "../../kernel/kstat.h"
++#include <rex/diag_sample.h>  // [cpu] report (t0 = GPU command processor thread)
+ 
+ namespace rex::graphics::null_gpu {
+ 
+@@ -34,6 +36,8 @@ class SwitchNullCommandProcessor : public CommandProcessor {
+ 
+   // Speed measurement for hardware runs: guest swaps, draws and copies per second.
+   void Tick() {
++    ::rex::kernel::kstat::CpuReport();
++    ::rex_diag::Sample();
+     using clock = std::chrono::steady_clock;
+     auto now = clock::now();
+     if (!perf_start_.time_since_epoch().count()) perf_start_ = now;
+diff --git a/src/kernel/kstat.h b/src/kernel/kstat.h
+index 715db81..9e7ef76 100644
+--- a/src/kernel/kstat.h
++++ b/src/kernel/kstat.h
+@@ -57,13 +57,43 @@ struct Scope {
+         double age = std::chrono::duration<double, std::milli>(now - ac.t0).count();
+         if (age > 1500) a += fmt::format(" {}={:.0f}ms", ac.key, age);
+       }
+-      std::string w;
+-      for (int i = 0; i < 64 && i < rex_diag::g_slots.n.load(); ++i)
+-        w += fmt::format(" t{:X}={}", rex_diag::g_slots.h[i], rex_diag::g_slots.fn[i] ? rex_diag::g_slots.fn[i] : "?");
+-      REXKRNL_INFO("[kstat] current guest function per thread:{}", w);
+       REXKRNL_INFO("[kstat] blocked >1.5s now:{}", a.empty() ? " (none)" : a);
+     }
+   }
+ };
+ }  // namespace rex::kernel::kstat
++#if REX_PLATFORM_SWITCH
++#include <switch.h>
++namespace rex::kernel::kstat {
++// Cheap per-thread CPU load report (Switch): every 5 s each guest thread that
++// passes through an instrumented kernel call logs its own CPU time share,
++// from the Horizon per-thread tick counter.
++inline void CpuReport() {
++  thread_local uint64_t w0 = 0, c0 = 0;
++  uint64_t c = 0;
++  if (R_FAILED(svcGetInfo(&c, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, UINT64_MAX))) return;
++  uint64_t w = armGetSystemTick();
++  if (!w0) {
++    w0 = w;
++    c0 = c;
++    return;
++  }
++  if (w - w0 >= armGetSystemTickFreq() * 5) {
++    auto* t = rex::system::XThread::GetCurrentThread();
++    REXKRNL_INFO("[cpu] t{:X} {:.0f}% of a core", t ? t->handle() : 0u,
++                 100.0 * double(c - c0) / double(w - w0));
++    w0 = w;
++    c0 = c;
++  }
++}
++}  // namespace rex::kernel::kstat
++#endif
++
++// Off by default (costly: string key + mutex per call). Build with -DREX_KSTAT=1 to enable.
++#if defined(REX_KSTAT) && REX_KSTAT
+ #define KSTAT(name) ::rex::kernel::kstat::Scope _kstat_scope(name)
++#elif REX_PLATFORM_SWITCH
++#define KSTAT(name) ::rex::kernel::kstat::CpuReport()
++#else
++#define KSTAT(name) ((void)0)
++#endif
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index eb7f640..112722e 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -1467,7 +1467,41 @@ void XHostThread::Execute() {
+ }  // namespace rex::system
+ 
+ #include <rex/diag_sample.h>
++#include <map>
++#include <string>
++#include <vector>
++#include <algorithm>
+ uint32_t rex_diag::CurrentHandle() {
+   auto* t = rex::system::XThread::GetCurrentThread();
+   return t ? t->handle() : 0u;
+ }
++void rex_diag::Sample() {
++  static std::map<const char*, uint32_t> hist[kThreads];
++  static uint32_t total[kThreads];
++  static auto last = std::chrono::steady_clock::now();
++  int n = std::min(g_count.load(), kThreads);
++  for (int i = 0; i < n; ++i) {
++    int d = g_slots[i].depth;
++    if (d <= 0) continue;
++    if (d > kDepth) d = kDepth;
++    const char* f = g_slots[i].stack[d - 1];
++    if (!f) continue;
++    ++hist[i][f];
++    ++total[i];
++  }
++  auto now = std::chrono::steady_clock::now();
++  if (now - last < std::chrono::seconds(10)) return;
++  last = now;
++  for (int i = 0; i < n; ++i) {
++    if (total[i] < 50) continue;
++    std::vector<std::pair<uint32_t, const char*>> v;
++    for (auto& [f, c] : hist[i]) v.push_back({c, f});
++    std::sort(v.rbegin(), v.rend());
++    std::string line;
++    for (size_t k = 0; k < v.size() && k < 8; ++k)
++      line += fmt::format(" {}={:.0f}%", v[k].second + 7, 100.0 * v[k].first / total[i]);
++    REXSYS_INFO("[prof] t{:X} ({} samples):{}", g_slots[i].handle, total[i], line);
++    hist[i].clear();
++    total[i] = 0;
++  }
++}
+-- 
+2.54.0
+

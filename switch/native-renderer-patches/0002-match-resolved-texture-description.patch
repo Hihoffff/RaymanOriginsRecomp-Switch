@@ -1,0 +1,98 @@
+diff --git a/tools/native_renderer/vk_renderer.h b/tools/native_renderer/vk_renderer.h
+--- a/tools/native_renderer/vk_renderer.h
++++ b/tools/native_renderer/vk_renderer.h
+@@ -186,6 +186,7 @@
+     // This frame: what got created or re-decoded (hitch attribution), and
+     // where EndFrame spent its time.
+     uint32_t newPipelines = 0, newTextures = 0, reuploads = 0;
++    uint32_t resolveMismatches = 0;
+     size_t uploadBytes = 0;
+     double recordMs = 0, waitMs = 0;
+   };
+@@ -203,6 +204,7 @@
+   void BeginFrame() {
+     stats_.draws = stats_.skipped = 0;
+     stats_.newPipelines = stats_.newTextures = stats_.reuploads = 0;
++    stats_.resolveMismatches = 0;
+     stats_.uploadBytes = 0;
+     stats_.recordMs = stats_.waitMs = 0;
+     StashFrame();
+@@ -266,7 +268,13 @@
+       op.rect[0] = v[0], op.rect[1] = v[1], op.rect[2] = v[0] + v[2], op.rect[3] = v[1] + v[3];
+     }
+     op.resolved = ResolvedFor(t);
+-    if (op.resolved) frameOps_.push_back(op);
++    if (op.resolved) {
++      op.resolved->format = t.format;
++      resolvedByBase_[t.base] = op.resolved;
++      frameOps_.push_back(op);
++    } else {
++      resolvedByBase_.erase(t.base);
++    }
+   }
+ 
+   // Captures one draw: copies its vertices, indices and constants right away,
+@@ -934,7 +942,7 @@
+   struct Resolved {
+     Image image;
+     int index = -1;
+-    uint32_t width = 0, height = 0;
++    uint32_t width = 0, height = 0, format = 0;
+   };
+   struct Op {
+     enum Kind { kDraw, kClear, kResolve } kind;
+@@ -987,7 +995,10 @@
+     uint64_t key = uint64_t(t.base) << 32 | t.width << 16 | t.height;
+     auto it = resolved_.find(key);
+     if (it != resolved_.end()) return &it->second;
+-    if (textureCount_ >= kMaxTextures) return nullptr;
++    if (textureCount_ >= kMaxTextures) {
++      ++notes_["texture heap full: resolve dropped"];
++      return nullptr;
++    }
+     Resolved& r = resolved_[key];
+     r.width = t.width, r.height = t.height;
+     r.image = CreateImage(t.width, t.height, kTargetFormat,
+@@ -1004,7 +1015,6 @@
+     vkCmdClearColorImage(uploads_, r.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+     Barrier(uploads_, r.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+     r.index = int(textureCount_++);
+-    resolvedByBase_[t.base] = &r;
+     AddHeapSlot(uint32_t(r.index), r.image.view);
+     stats_.textures = textureCount_;
+     return &r;
+@@ -1358,7 +1368,18 @@
+   }
+ 
+   int Texture(const xenos::TextureFetch& t, const uint8_t* fetch) {
+-    if (auto rit = resolvedByBase_.find(t.base); rit != resolvedByBase_.end()) return rit->second->index;
++    if (auto rit = resolvedByBase_.find(t.base); rit != resolvedByBase_.end()) {
++      const Resolved& r = *rit->second;
++      // Streaming can reuse a resolve's address for an ordinary texture.
++      if (r.width == t.width && r.height == t.height && r.format == t.format) return r.index;
++      if (stats_.resolveMismatches++ == 0) {
++        char note[160];
++        std::snprintf(note, sizeof(note),
++                      "resolve mismatch at %08X: fetch %ux%u fmt 0x%02X, resolve %ux%u fmt 0x%02X",
++                      t.base, t.width, t.height, t.format, r.width, r.height, r.format);
++        ++notes_[note];
++      }
++    }
+     uint64_t key = uint64_t(xenos::BE32(fetch + 4)) << 32 | xenos::BE32(fetch + 8);
+     auto it = textures_.find(key);
+     if (it != textures_.end()) {
+@@ -1384,9 +1405,13 @@
+       }
+     }
+     TextureEntry& e = textures_[key];
+-    if (!xenos::Supported(t.format) || textureCount_ >= kMaxTextures) {
++    if (!xenos::Supported(t.format)) {
+       ++skipReasons_["texture format 0x" + std::to_string(t.format) + " (" + std::to_string(t.width) + "x" +
+                      std::to_string(t.height) + ") not supported"];
++      return -1;
++    }
++    if (textureCount_ >= kMaxTextures) {
++      ++skipReasons_["texture heap full"];
+       return -1;
+     }
+     // k_8 stays one channel: R8 read through an RRRR swizzle, the same values

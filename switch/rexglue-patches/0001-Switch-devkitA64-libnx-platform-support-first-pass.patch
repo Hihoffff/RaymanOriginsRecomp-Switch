@@ -1,0 +1,1255 @@
+From 7dcd82d780c03eb16335e57011d944218af0e5ff Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 16:46:53 +0300
+Subject: [PATCH] Switch (devkitA64/libnx) platform support: first pass
+
+REX_PLATFORM_SWITCH, GCC allowed for Switch, no SDL3 (nop/stub audio, input,
+UI), static rexruntime, offline XAM net stub, VI surface placeholder.
+Originally written by Kimi; reviewed by Claude.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                               |  25 +-
+ cmake/rexglue_helpers.cmake                  |  13 +-
+ include/rex/filesystem/devices/stfs_xbox.h   |  11 +
+ include/rex/platform.h                       |   7 +-
+ include/rex/platform/dynlib.h                |   7 +
+ include/rex/ui/surface.h                     |   3 +
+ include/rex/ui/surface_switch.h              |  30 ++
+ include/rex/ui/window_switch.h               |  34 ++
+ include/rex/ui/windowed_app_context_switch.h |  35 ++
+ src/audio/CMakeLists.txt                     |  18 +-
+ src/input/CMakeLists.txt                     |   7 +-
+ src/input/input_system.cpp                   |   4 +
+ src/kernel/CMakeLists.txt                    |   6 +
+ src/kernel/xam/xam_net_switch.cpp            | 400 +++++++++++++++++++
+ src/system/CMakeLists.txt                    |  16 +-
+ src/ui/CMakeLists.txt                        |  52 ++-
+ src/ui/surface_switch.cpp                    |  13 +
+ src/ui/window_switch.cpp                     |  66 +++
+ src/ui/windowed_app_context_switch.cpp       |  40 ++
+ src/ui/windowed_app_main_switch.cpp          |  91 +++++
+ thirdparty/CMakeLists.txt                    |  18 +-
+ thirdparty/crypto/sha256.cpp                 |   3 +-
+ 22 files changed, 865 insertions(+), 34 deletions(-)
+ create mode 100644 include/rex/ui/surface_switch.h
+ create mode 100644 include/rex/ui/window_switch.h
+ create mode 100644 include/rex/ui/windowed_app_context_switch.h
+ create mode 100644 src/kernel/xam/xam_net_switch.cpp
+ create mode 100644 src/ui/surface_switch.cpp
+ create mode 100644 src/ui/window_switch.cpp
+ create mode 100644 src/ui/windowed_app_context_switch.cpp
+ create mode 100644 src/ui/windowed_app_main_switch.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6bccbe5..1483552 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -81,9 +81,14 @@ elseif(APPLE)
+     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+ endif()
+ 
+-# Enforce a Clang toolchain (LLVM Clang or Apple's Clang)
++# Enforce a Clang toolchain (LLVM Clang or Apple's Clang).
++# Exception: Nintendo Switch builds go through devkitA64, which ships GCC only.
+ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
+-    message(FATAL_ERROR "ReXGlue requires the Clang compiler (LLVM Clang or AppleClang). Please set CMAKE_CXX_COMPILER to clang++")
++    if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
++        message(WARNING "Nintendo Switch build: using GCC ${CMAKE_CXX_COMPILER_VERSION} from devkitA64 (upstream requires Clang)")
++    else()
++        message(FATAL_ERROR "ReXGlue requires the Clang compiler (LLVM Clang or AppleClang). Please set CMAKE_CXX_COMPILER to clang++")
++    endif()
+ endif()
+ 
+ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+@@ -133,7 +138,8 @@ endif()
+ # Global compile options
+ add_compile_options(
+     -fno-strict-aliasing
+-    -ffp-model=strict
++    $<$<CXX_COMPILER_ID:Clang,AppleClang>:-ffp-model=strict>
++    $<$<CXX_COMPILER_ID:GNU>:-ffp-contract=off>
+     $<$<CONFIG:DEBUG>:-g>
+     $<$<CONFIG:DEBUG>:-O0>
+     $<$<CONFIG:RELEASE>:-O3>
+@@ -151,7 +157,12 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+     list(GET CMAKE_OSX_ARCHITECTURES 0 REX_TARGET_PROCESSOR)
+ endif()
+ 
+-if(WIN32)
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    set(REX_PLATFORM "switch-arm64")
++    # newlib hides POSIX declarations (posix_memalign, strdup, ...) behind
++    # feature test macros when compiled with -std=c++23 (__STRICT_ANSI__).
++    add_compile_definitions(REX_PLATFORM_SWITCH=1 _DEFAULT_SOURCE _POSIX_C_SOURCE=200809L)
++elseif(WIN32)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "win-amd64")
+     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+@@ -296,8 +307,10 @@ message(STATUS "  Tracy: ${REXGLUE_ENABLE_TRACY}")
+ message(STATUS "  Perf Counters: ${REXGLUE_ENABLE_PERF_COUNTERS}")
+ message(STATUS "===========================================")
+ 
+-# SDK install/export rules (skipped when consumed as a subdirectory)
+-if(PROJECT_IS_TOP_LEVEL)
++# SDK install/export rules (skipped when consumed as a subdirectory).
++# Switch SDK is consumed from the source tree (REXSDK_DIR); with a static
++# rexruntime the OBJECT-library deps would all need export sets.
++if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+     include(cmake/rexglue_devenv.cmake)
+     include(cmake/rexglue_install.cmake)
+ else()
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 41e6dce..98f7638 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -77,9 +77,16 @@ endfunction()
+ function(rexglue_configure_target target_name)
+     cmake_parse_arguments(ARG "" "" "GPU_PLUGINS" ${ARGN})
+ 
+-    target_sources(${target_name} PRIVATE
+-        ${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp
+-        ${REXGLUE_SHARE_DIR}/rex_app.cpp)
++    if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++        # No SDL on Switch; the entry point drives a libnx-style loop.
++        target_sources(${target_name} PRIVATE
++            ${REXGLUE_SHARE_DIR}/windowed_app_main_switch.cpp
++            ${REXGLUE_SHARE_DIR}/rex_app.cpp)
++    else()
++        target_sources(${target_name} PRIVATE
++            ${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp
++            ${REXGLUE_SHARE_DIR}/rex_app.cpp)
++    endif()
+ 
+     target_compile_definitions(${target_name} PRIVATE
+         REXGLUE_BUILD_CONFIG="$<CONFIG>")
+diff --git a/include/rex/filesystem/devices/stfs_xbox.h b/include/rex/filesystem/devices/stfs_xbox.h
+index 7d4e366..13af98c 100644
+--- a/include/rex/filesystem/devices/stfs_xbox.h
++++ b/include/rex/filesystem/devices/stfs_xbox.h
+@@ -42,6 +42,17 @@ inline uint64_t decode_fat_timestamp(const uint32_t date, const uint32_t time) {
+ 
+ #if REX_PLATFORM_WIN32
+   time_t timet = _mkgmtime(&tm);
++#elif REX_PLATFORM_SWITCH
++  // newlib has no timegm; convert broken-down UTC directly (days-from-civil).
++  const int64_t cy = tm.tm_year + 1900 - (tm.tm_mon + 1 <= 2);
++  const int64_t era = (cy >= 0 ? cy : cy - 399) / 400;
++  const uint32_t yoe = static_cast<uint32_t>(cy - era * 400);
++  const uint32_t mp = static_cast<uint32_t>((tm.tm_mon + 10) % 12);
++  const uint32_t doy = (153 * mp + 2) / 5 + static_cast<uint32_t>(tm.tm_mday) - 1;
++  const uint32_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++  const int64_t days = era * 146097 + static_cast<int64_t>(doe) - 719468;
++  time_t timet = static_cast<time_t>(days * 86400 + tm.tm_hour * 3600 +
++                                     tm.tm_min * 60 + tm.tm_sec);
+ #else
+   time_t timet = timegm(&tm);
+ #endif
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index e90418d..c5904a6 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -28,7 +28,9 @@
+ #include <TargetConditionals.h>
+ #endif
+ 
+-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
++#if defined(__SWITCH__)
++#define REX_PLATFORM_SWITCH 1
++#elif defined(TARGET_OS_MAC) && TARGET_OS_MAC
+ #define REX_PLATFORM_MAC 1
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
+@@ -44,6 +46,9 @@
+ 
+ // Ensure all platform macros are always defined (0 when inactive)
+ // so they can be used in static_assert and regular expressions.
++#ifndef REX_PLATFORM_SWITCH
++#define REX_PLATFORM_SWITCH 0
++#endif
+ #ifndef REX_PLATFORM_MAC
+ #define REX_PLATFORM_MAC 0
+ #endif
+diff --git a/include/rex/platform/dynlib.h b/include/rex/platform/dynlib.h
+index e3fc40d..8b44084 100644
+--- a/include/rex/platform/dynlib.h
++++ b/include/rex/platform/dynlib.h
+@@ -71,6 +71,13 @@ inline constexpr const char* kVulkanLoader = "libvulkan.1.dylib";
+ inline constexpr const char* kRenderDoc = "librenderdoc.dylib";
+ inline constexpr const char* kSpirvToolsSdkPath = "lib/libSPIRV-Tools-shared.dylib";
+ 
++#elif REX_PLATFORM_SWITCH
++
++// No dynamic loading on Horizon: the NVK driver is linked statically.
++inline constexpr const char* kVulkanLoader = "";
++inline constexpr const char* kRenderDoc = "";
++inline constexpr const char* kSpirvToolsSdkPath = "";
++
+ #else
+ #error No library names provided for the target platform.
+ #endif
+diff --git a/include/rex/ui/surface.h b/include/rex/ui/surface.h
+index a302000..6cfcdc3 100644
+--- a/include/rex/ui/surface.h
++++ b/include/rex/ui/surface.h
+@@ -36,6 +36,8 @@ class Surface {
+     kTypeIndex_Win32Hwnd,
+     // macOS — CAMetalLayer presented via MoltenVK (VK_EXT_metal_surface).
+     kTypeIndex_CAMetalLayer,
++    // Nintendo Switch — VI layer presented via NVK (VK_NN_vi_surface).
++    kTypeIndex_SwitchVi,
+   };
+   using TypeFlags = uint32_t;
+   enum : TypeFlags {
+@@ -44,6 +46,7 @@ class Surface {
+     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
+     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
+     kTypeFlag_CAMetalLayer = TypeFlags(1) << kTypeIndex_CAMetalLayer,
++    kTypeFlag_SwitchVi = TypeFlags(1) << kTypeIndex_SwitchVi,
+   };
+ 
+   Surface(const Surface& surface) = delete;
+diff --git a/include/rex/ui/surface_switch.h b/include/rex/ui/surface_switch.h
+new file mode 100644
+index 0000000..44cf786
+--- /dev/null
++++ b/include/rex/ui/surface_switch.h
+@@ -0,0 +1,30 @@
++/**
++ * @file        ui/surface_switch.h
++ * @brief       Nintendo Switch surface (VI layer via NVK)
++ *
++ * Headless stand-in for bring-up: reports a fixed docked-mode size so
++ * surface queries succeed before the NVK/VI presenter exists.
++ */
++
++#pragma once
++
++#include <cstdint>
++
++#include <rex/ui/surface.h>
++
++namespace rex::ui {
++
++class SwitchSurface final : public Surface {
++ public:
++  TypeIndex GetType() const override { return kTypeIndex_SwitchVi; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override {
++    // Docked-mode resolution; handheld is 1280x720, but presenting scales.
++    width_out = 1920;
++    height_out = 1080;
++    return true;
++  }
++};
++
++}  // namespace rex::ui
+diff --git a/include/rex/ui/window_switch.h b/include/rex/ui/window_switch.h
+new file mode 100644
+index 0000000..70a1503
+--- /dev/null
++++ b/include/rex/ui/window_switch.h
+@@ -0,0 +1,34 @@
++/**
++ * @file        ui/window_switch.h
++ * @brief       Nintendo Switch implementation of the Window abstraction
++ *
++ * Horizon has no window manager: the "window" is the single fullscreen VI
++ * layer. This implementation is headless — it tracks state so the common
++ * Window/WindowedApp code runs, and producing pixels is left to the future
++ * NVK presenter.
++ */
++
++#pragma once
++
++#include <memory>
++#include <string_view>
++
++#include <rex/ui/window.h>
++
++namespace rex::ui {
++
++class WindowSwitch final : public Window {
++ public:
++  WindowSwitch(WindowedAppContext& app_context, std::string_view title,
++               uint32_t desired_logical_width, uint32_t desired_logical_height);
++  ~WindowSwitch() override;
++
++ protected:
++  bool OpenImpl() override;
++  void RequestCloseImpl() override;
++
++  std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
++  void RequestPaintImpl() override;
++};
++
++}  // namespace rex::ui
+diff --git a/include/rex/ui/windowed_app_context_switch.h b/include/rex/ui/windowed_app_context_switch.h
+new file mode 100644
+index 0000000..2f44750
+--- /dev/null
++++ b/include/rex/ui/windowed_app_context_switch.h
+@@ -0,0 +1,35 @@
++/**
++ * @file        ui/windowed_app_context_switch.h
++ * @brief       Nintendo Switch implementation of the windowed app UI loop context
++ *
++ * Horizon has no OS message loop for apps, so the context runs its own loop
++ * on a condition variable: producers wake it via NotifyUILoopOfPendingFunctions.
++ */
++
++#pragma once
++
++#include <condition_variable>
++#include <mutex>
++
++#include <rex/ui/windowed_app_context.h>
++
++namespace rex::ui {
++
++class SwitchWindowedAppContext final : public WindowedAppContext {
++ public:
++  SwitchWindowedAppContext() = default;
++  ~SwitchWindowedAppContext() override;
++
++  bool Initialize() { return true; }
++  int RunMainMessageLoop();
++
++ protected:
++  void NotifyUILoopOfPendingFunctions() override;
++  void PlatformQuitFromUIThread() override;
++
++ private:
++  std::mutex loop_mutex_;
++  std::condition_variable loop_cv_;
++};
++
++}  // namespace rex::ui
+diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
+index d55f16a..a973cea 100644
+--- a/src/audio/CMakeLists.txt
++++ b/src/audio/CMakeLists.txt
+@@ -2,7 +2,7 @@
+ # Audio processing and XMA decoding for Xbox 360 emulation
+ 
+ add_library(rexaudio OBJECT
+-    
++
+     audio_driver.cpp
+     audio_system.cpp
+     downmix.cpp
+@@ -11,10 +11,15 @@ add_library(rexaudio OBJECT
+     xma_register_file.cpp
+     # NOP backend (always available)
+     nop/nop_audio_system.cpp
+-    # SDL backend
+-    sdl/sdl_audio_system.cpp
+-    sdl/sdl_audio_driver.cpp
+ )
++
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    # SDL backend (no SDL3 port for Switch)
++    target_sources(rexaudio PRIVATE
++        sdl/sdl_audio_system.cpp
++        sdl/sdl_audio_driver.cpp
++    )
++endif()
+ add_library(rex::audio ALIAS rexaudio)
+ 
+ rex_target_pch(rexaudio
+@@ -36,6 +41,9 @@ target_include_directories(rexaudio PUBLIC
+ )
+ 
+ target_link_libraries(rexaudio
+-    PUBLIC rexcore SDL3::SDL3
++    PUBLIC rexcore
+     PRIVATE libavcodec libavutil
+ )
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    target_link_libraries(rexaudio PUBLIC SDL3::SDL3)
++endif()
+diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
+index 3ea3535..f17e36e 100644
+--- a/src/input/CMakeLists.txt
++++ b/src/input/CMakeLists.txt
+@@ -31,8 +31,11 @@ target_include_directories(rexinput PUBLIC
+ )
+ if(WIN32)
+     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp xinput/xinput_input_driver.cpp)
+-else()
++elseif(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
+ endif()
+ 
+-target_link_libraries(rexinput PUBLIC rexcore rexui SDL3::SDL3)
++target_link_libraries(rexinput PUBLIC rexcore rexui)
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    target_link_libraries(rexinput PUBLIC SDL3::SDL3)
++endif()
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..72d1c73 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -19,7 +19,9 @@
+ #include <rex/input/input_system.h>
+ #include <rex/input/mnk/mnk_input_driver.h>
+ #include <rex/input/nop/nop_input_driver.h>
++#if !REX_PLATFORM_SWITCH
+ #include <rex/input/sdl/sdl_input_driver.h>
++#endif
+ #include <rex/input/state_merge.h>
+ #include <rex/input/xinput/xinput_input_driver.h>
+ #include <rex/logging.h>
+@@ -334,12 +336,14 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+     }
+ #endif
+ 
++#if !REX_PLATFORM_SWITCH
+     if (REXCVAR_GET(input_backend) == "sdl") {
+       auto sdl_driver = std::make_unique<sdl::SDLInputDriver>(nullptr, 0);
+       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
+         input->AddDriver(std::move(sdl_driver));
+       }
+     }
++#endif
+ 
+     // MnK driver (keyboard/mouse -> controller emulation)
+     auto mnk_driver = std::make_unique<mnk::MnkInputDriver>(nullptr, 0);
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 984b97d..dd4878a 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -63,6 +63,12 @@ set(REXKERNEL_SOURCES
+     crt/threading.cpp
+ )
+ 
++# xam_net.cpp needs BSD sockets; Switch uses the offline stub instead.
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    list(REMOVE_ITEM REXKERNEL_SOURCES xam/xam_net.cpp)
++    list(APPEND REXKERNEL_SOURCES xam/xam_net_switch.cpp)
++endif()
++
+ list(TRANSFORM REXKERNEL_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
+ target_sources(rexruntime PRIVATE ${REXKERNEL_SOURCES})
+ 
+diff --git a/src/kernel/xam/xam_net_switch.cpp b/src/kernel/xam/xam_net_switch.cpp
+new file mode 100644
+index 0000000..d3e7846
+--- /dev/null
++++ b/src/kernel/xam/xam_net_switch.cpp
+@@ -0,0 +1,400 @@
++/**
++ * @file        kernel/xam/xam_net_switch.cpp
++ * @brief       Offline NetDll stub for Nintendo Switch (no BSD sockets in newlib)
++ *
++ * Rayman Origins is playable offline, so every NetDll_* import answers
++ * consistently as "no network". WSA events are real kernel events because the
++ * game waits on them. Semantics mirror the proven stub from the upstream
++ * switch branch (runtime/kernel/net_imports.cpp). A proper port would go
++ * through libnx's bsd service.
++ */
++
++// Disable warnings about unused parameters for kernel functions
++#pragma GCC diagnostic ignored "-Wunused-parameter"
++
++#include <cstring>
++
++#include <rex/kernel/xam/module.h>
++#include <rex/kernel/xam/private.h>
++#include <rex/kernel/xboxkrnl/error.h>
++#include <rex/kernel/xboxkrnl/threading.h>
++#include <rex/logging.h>
++#include <rex/string.h>
++#include <rex/hook.h>
++#include <rex/types.h>
++#include <rex/system/kernel_state.h>
++
++namespace rex {
++namespace kernel {
++namespace xam {
++using namespace rex::system;
++using namespace rex::system::xam;
++
++// Guest-visible types from xam_net.cpp. Forward declarations suffice: the
++// stubs never dereference them.
++struct XNetStartupParams;
++struct X_WSADATA;
++struct XWSABUF;
++struct XSOCKADDR;
++struct XSOCKADDR_IN;
++struct XWSAOVERLAPPED;
++struct XNADDR;
++struct XNDNS;
++struct XNQOS;
++struct x_fd_set;
++
++constexpr uint32_t kSocketError = ~0u;
++constexpr uint32_t kInvalidSocket = ~0u;
++constexpr uint32_t kWSANetDown = 10050;
++constexpr uint32_t kWSAHostNotFound = 11001;
++constexpr uint32_t kXNetGetXnAddrNone = 0x00000001;
++
++static uint32_t NetFail(uint32_t error) {
++  XThread::SetLastError(error);
++  return kSocketError;
++}
++
++// --- Lifecycle: report success so the title believes XNet is up. ---
++
++u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) { return 0; }
++u32 NetDll_XNetCleanup_entry(u32 caller, mapped_void params) { return 0; }
++u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
++                            mapped_u32 buffer_size) {
++  return kSocketError;
++}
++u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
++  // Matches xam_net.cpp: constant values make replicating easier.
++  std::memset(buffer_ptr, 0xBB, length);
++  return 0;
++}
++u32 NetDll_WSAStartup_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_ptr) { return 0; }
++u32 NetDll_WSACleanup_entry(u32 caller) { return 0; }
++u32 NetDll_WSAGetLastError_entry() { return XThread::GetLastError(); }
++void NetDll_WSASetLastError_entry(u32 error_code) { XThread::SetLastError(error_code); }
++
++// --- WSA events: real kernel events, the game waits on them. ---
++
++u32 NetDll_WSAWaitForMultipleEvents_entry(u32 num_events, mapped_u32 events, u32 wait_all,
++                                          u32 timeout, u32 alertable) {
++  if (num_events > 64) {
++    XThread::SetLastError(87);  // ERROR_INVALID_PARAMETER
++    return ~0u;
++  }
++
++  uint64_t timeout_wait = (uint64_t)timeout;
++
++  X_STATUS result = 0;
++  do {
++    result = xboxkrnl::xeNtWaitForMultipleObjectsEx(num_events, events, wait_all, 1, alertable,
++                                                    timeout != -1 ? &timeout_wait : nullptr);
++  } while (result == X_STATUS_ALERTED);
++
++  if (XFAILED(result)) {
++    uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
++    XThread::SetLastError(error);
++    return ~0u;
++  }
++  return 0;
++}
++
++u32 NetDll_WSACreateEvent_entry() {
++  XEvent* ev = new XEvent(REX_KERNEL_STATE());
++  ev->Initialize(true, false);
++  return ev->handle();
++}
++
++u32 NetDll_WSACloseEvent_entry(u32 event_handle) {
++  X_STATUS result = REX_KERNEL_OBJECTS()->ReleaseHandle(event_handle);
++  if (XFAILED(result)) {
++    uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
++    XThread::SetLastError(error);
++    return 0;
++  }
++  return 1;
++}
++
++u32 NetDll_WSAResetEvent_entry(u32 event_handle) {
++  X_STATUS result = xboxkrnl::xeNtClearEvent(event_handle);
++  if (XFAILED(result)) {
++    uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
++    XThread::SetLastError(error);
++    return 0;
++  }
++  return 1;
++}
++
++u32 NetDll_WSASetEvent_entry(u32 event_handle) {
++  X_STATUS result = xboxkrnl::xeNtSetEvent(event_handle, nullptr);
++  if (XFAILED(result)) {
++    uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
++    XThread::SetLastError(error);
++    return 0;
++  }
++  return 1;
++}
++
++// --- Addressing: no interface, no online identity. ---
++
++u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
++  return kXNetGetXnAddrNone;
++}
++u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
++  return kXNetGetXnAddrNone;
++}
++u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, mapped_u32 id_ptr) {
++  return kSocketError;
++}
++void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string string_out,
++                                     u32 string_size) {
++  rex::string::copy_truncating(string_out, "666.666.666.666", string_size);
++}
++u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
++                                    mapped_void in_addr) {
++  return kSocketError;
++}
++u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
++                                    mapped_void xid) {
++  return kSocketError;
++}
++u32 NetDll_XNetSetSystemLinkPort_entry(u32 caller, u32 port) { return 0; }
++u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) { return 0; }
++u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle,
++                               mapped_u32 pdns) {
++  return kWSAHostNotFound;
++}
++u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) { return 0; }
++u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) { return 0; }
++u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
++                               u32 flags) {
++  return kSocketError;
++}
++u32 NetDll_inet_addr_entry(mapped_string addr_ptr) { return ~0u; }  // INADDR_NONE
++
++// --- Sockets: network is down. ---
++
++u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
++  XThread::SetLastError(kWSANetDown);
++  return kInvalidSocket;
++}
++u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) { return NetFail(kWSANetDown); }
++u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
++                            mapped_void optval_ptr, u32 optlen) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name, u32 namelen) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> name, u32 namelen) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr_ptr,
++                        mapped_u32 addrlen_ptr) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
++                      u32 flags) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
++                          u32 flags, ppc_ptr_t<XSOCKADDR_IN> from_ptr, mapped_u32 fromlen_ptr) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
++                      u32 flags) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
++                        u32 flags, ppc_ptr_t<XSOCKADDR_IN> to_ptr, u32 to_len) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_WSARecvFrom_entry(u32 caller, u32 socket, ppc_ptr_t<XWSABUF> buffers_ptr,
++                             u32 buffer_count, mapped_u32 num_bytes_recv, mapped_u32 flags_ptr,
++                             ppc_ptr_t<XSOCKADDR_IN> from_addr,
++                             ppc_ptr_t<XWSAOVERLAPPED> overlapped_ptr,
++                             mapped_void completion_routine_ptr) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buffers,
++                           u32 num_buffers, mapped_u32 num_bytes_sent, u32 flags,
++                           ppc_ptr_t<XSOCKADDR_IN> to_ptr, u32 to_len,
++                           ppc_ptr_t<XWSAOVERLAPPED> overlapped, mapped_void completion_routine) {
++  return NetFail(kWSANetDown);
++}
++u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) { return 0; }
++
++}  // namespace xam
++}  // namespace kernel
++}  // namespace rex
++
++REX_EXPORT(__imp__NetDll_XNetStartup, rex::kernel::xam::NetDll_XNetStartup_entry)
++REX_EXPORT(__imp__NetDll_XNetCleanup, rex::kernel::xam::NetDll_XNetCleanup_entry)
++REX_EXPORT(__imp__NetDll_XNetGetOpt, rex::kernel::xam::NetDll_XNetGetOpt_entry)
++REX_EXPORT(__imp__NetDll_XNetRandom, rex::kernel::xam::NetDll_XNetRandom_entry)
++REX_EXPORT(__imp__NetDll_WSAStartup, rex::kernel::xam::NetDll_WSAStartup_entry)
++REX_EXPORT(__imp__NetDll_WSACleanup, rex::kernel::xam::NetDll_WSACleanup_entry)
++REX_EXPORT(__imp__NetDll_WSAGetLastError, rex::kernel::xam::NetDll_WSAGetLastError_entry)
++REX_EXPORT(__imp__NetDll_WSARecvFrom, rex::kernel::xam::NetDll_WSARecvFrom_entry)
++REX_EXPORT(__imp__NetDll_WSASendTo, rex::kernel::xam::NetDll_WSASendTo_entry)
++REX_EXPORT(__imp__NetDll_WSAWaitForMultipleEvents,
++           rex::kernel::xam::NetDll_WSAWaitForMultipleEvents_entry)
++REX_EXPORT(__imp__NetDll_WSACreateEvent, rex::kernel::xam::NetDll_WSACreateEvent_entry)
++REX_EXPORT(__imp__NetDll_WSACloseEvent, rex::kernel::xam::NetDll_WSACloseEvent_entry)
++REX_EXPORT(__imp__NetDll_WSAResetEvent, rex::kernel::xam::NetDll_WSAResetEvent_entry)
++REX_EXPORT(__imp__NetDll_WSASetEvent, rex::kernel::xam::NetDll_WSASetEvent_entry)
++REX_EXPORT(__imp__NetDll_XNetGetTitleXnAddr, rex::kernel::xam::NetDll_XNetGetTitleXnAddr_entry)
++REX_EXPORT(__imp__NetDll_XNetGetDebugXnAddr, rex::kernel::xam::NetDll_XNetGetDebugXnAddr_entry)
++REX_EXPORT(__imp__NetDll_XNetXnAddrToMachineId,
++           rex::kernel::xam::NetDll_XNetXnAddrToMachineId_entry)
++REX_EXPORT(__imp__NetDll_XNetInAddrToString, rex::kernel::xam::NetDll_XNetInAddrToString_entry)
++REX_EXPORT(__imp__NetDll_XNetXnAddrToInAddr, rex::kernel::xam::NetDll_XNetXnAddrToInAddr_entry)
++REX_EXPORT(__imp__NetDll_XNetInAddrToXnAddr, rex::kernel::xam::NetDll_XNetInAddrToXnAddr_entry)
++REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
++           rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
++REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
++           rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
++REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
++REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
++REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
++REX_EXPORT(__imp__NetDll_XNetQosRelease, rex::kernel::xam::NetDll_XNetQosRelease_entry)
++REX_EXPORT(__imp__NetDll_XNetQosListen, rex::kernel::xam::NetDll_XNetQosListen_entry)
++REX_EXPORT(__imp__NetDll_inet_addr, rex::kernel::xam::NetDll_inet_addr_entry)
++REX_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
++REX_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
++REX_EXPORT(__imp__NetDll_shutdown, rex::kernel::xam::NetDll_shutdown_entry)
++REX_EXPORT(__imp__NetDll_setsockopt, rex::kernel::xam::NetDll_setsockopt_entry)
++REX_EXPORT(__imp__NetDll_ioctlsocket, rex::kernel::xam::NetDll_ioctlsocket_entry)
++REX_EXPORT(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry)
++REX_EXPORT(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry)
++REX_EXPORT(__imp__NetDll_listen, rex::kernel::xam::NetDll_listen_entry)
++REX_EXPORT(__imp__NetDll_accept, rex::kernel::xam::NetDll_accept_entry)
++REX_EXPORT(__imp__NetDll_select, rex::kernel::xam::NetDll_select_entry)
++REX_EXPORT(__imp__NetDll_recv, rex::kernel::xam::NetDll_recv_entry)
++REX_EXPORT(__imp__NetDll_recvfrom, rex::kernel::xam::NetDll_recvfrom_entry)
++REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
++REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
++REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
++REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
++
++REX_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
++REX_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
++REX_EXPORT_STUB(__imp__NetDll_UpnpActionGetResults);
++REX_EXPORT_STUB(__imp__NetDll_UpnpCleanup);
++REX_EXPORT_STUB(__imp__NetDll_UpnpCloseHandle);
++REX_EXPORT_STUB(__imp__NetDll_UpnpDescribeCreate);
++REX_EXPORT_STUB(__imp__NetDll_UpnpDescribeGetResults);
++REX_EXPORT_STUB(__imp__NetDll_UpnpDoWork);
++REX_EXPORT_STUB(__imp__NetDll_UpnpEventCreate);
++REX_EXPORT_STUB(__imp__NetDll_UpnpEventGetCurrentState);
++REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
++REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
++REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
++REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
++REX_EXPORT_STUB(__imp__NetDll_WSACancelOverlappedIO);
++REX_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
++REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
++REX_EXPORT_STUB(__imp__NetDll_WSARecv);
++REX_EXPORT_STUB(__imp__NetDll_WSASend);
++REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
++REX_EXPORT_STUB(__imp__NetDll_XHttpCloseHandle);
++REX_EXPORT_STUB(__imp__NetDll_XHttpConnect);
++REX_EXPORT_STUB(__imp__NetDll_XHttpCrackUrl);
++REX_EXPORT_STUB(__imp__NetDll_XHttpCrackUrlW);
++REX_EXPORT_STUB(__imp__NetDll_XHttpCreateUrl);
++REX_EXPORT_STUB(__imp__NetDll_XHttpCreateUrlW);
++REX_EXPORT_STUB(__imp__NetDll_XHttpDoWork);
++REX_EXPORT_STUB(__imp__NetDll_XHttpGetPerfCounters);
++REX_EXPORT_STUB(__imp__NetDll_XHttpOpen);
++REX_EXPORT_STUB(__imp__NetDll_XHttpOpenRequest);
++REX_EXPORT_STUB(__imp__NetDll_XHttpOpenRequestUsingMemory);
++REX_EXPORT_STUB(__imp__NetDll_XHttpQueryAuthSchemes);
++REX_EXPORT_STUB(__imp__NetDll_XHttpQueryHeaders);
++REX_EXPORT_STUB(__imp__NetDll_XHttpQueryOption);
++REX_EXPORT_STUB(__imp__NetDll_XHttpReadData);
++REX_EXPORT_STUB(__imp__NetDll_XHttpReceiveResponse);
++REX_EXPORT_STUB(__imp__NetDll_XHttpResetPerfCounters);
++REX_EXPORT_STUB(__imp__NetDll_XHttpSendRequest);
++REX_EXPORT_STUB(__imp__NetDll_XHttpSetCredentials);
++REX_EXPORT_STUB(__imp__NetDll_XHttpSetOption);
++REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
++REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
++REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
++REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
++REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
++REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
++REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
++REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
++REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
++REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
++REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
++REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
++REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
++REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
++REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
++REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
++REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
++REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
++REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
++REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
++REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
++REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
++REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
++REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
++REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
++REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
++REX_EXPORT_STUB(__imp__NetDll_XmlDownloadStart);
++REX_EXPORT_STUB(__imp__NetDll_XmlDownloadStop);
++REX_EXPORT_STUB(__imp__NetDll_XnpCapture);
++REX_EXPORT_STUB(__imp__NetDll_XnpConfig);
++REX_EXPORT_STUB(__imp__NetDll_XnpConfigUPnP);
++REX_EXPORT_STUB(__imp__NetDll_XnpConfigUPnPPortAndExternalAddr);
++REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptRecv);
++REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptSetCallbacks);
++REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptSetExtendedReceiveCallback);
++REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptXmit);
++REX_EXPORT_STUB(__imp__NetDll_XnpEthernetInterceptXmitAsIp);
++REX_EXPORT_STUB(__imp__NetDll_XnpGetActiveSocketList);
++REX_EXPORT_STUB(__imp__NetDll_XnpGetConfigStatus);
++REX_EXPORT_STUB(__imp__NetDll_XnpGetKeyList);
++REX_EXPORT_STUB(__imp__NetDll_XnpGetQosLookupList);
++REX_EXPORT_STUB(__imp__NetDll_XnpGetSecAssocList);
++REX_EXPORT_STUB(__imp__NetDll_XnpGetVlanXboxName);
++REX_EXPORT_STUB(__imp__NetDll_XnpLoadConfigParams);
++REX_EXPORT_STUB(__imp__NetDll_XnpLoadMachineAccount);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonClearChallenge);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonClearQEvent);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetChallenge);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetQFlags);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetQVals);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetStatus);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetChallengeResponse);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetPState);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetQEvent);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetQFlags);
++REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetQVals);
++REX_EXPORT_STUB(__imp__NetDll_XnpNoteSystemTime);
++REX_EXPORT_STUB(__imp__NetDll_XnpPersistTitleState);
++REX_EXPORT_STUB(__imp__NetDll_XnpQosHistoryGetAggregateMeasurement);
++REX_EXPORT_STUB(__imp__NetDll_XnpQosHistoryGetEntries);
++REX_EXPORT_STUB(__imp__NetDll_XnpQosHistoryLoad);
++REX_EXPORT_STUB(__imp__NetDll_XnpQosHistorySaveMeasurements);
++REX_EXPORT_STUB(__imp__NetDll_XnpRegisterKeyForCallerType);
++REX_EXPORT_STUB(__imp__NetDll_XnpReplaceKeyForCallerType);
++REX_EXPORT_STUB(__imp__NetDll_XnpSaveConfigParams);
++REX_EXPORT_STUB(__imp__NetDll_XnpSaveMachineAccount);
++REX_EXPORT_STUB(__imp__NetDll_XnpSetVlanXboxName);
++REX_EXPORT_STUB(__imp__NetDll_XnpToolIpProxyInject);
++REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
++REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
++REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
++REX_EXPORT_STUB(__imp__NetDll_getpeername);
++REX_EXPORT_STUB(__imp__NetDll_getsockname);
++REX_EXPORT_STUB(__imp__NetDll_getsockopt);
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index fc46d86..930987d 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -48,7 +48,17 @@ set(REXSYSTEM_SOURCES
+     xex_module.cpp
+ )
+ 
+-add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
++# newlib/libnx has no BSD socket headers; XAM net imports stay stubbed.
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    list(REMOVE_ITEM REXSYSTEM_SOURCES xsocket.cpp)
++endif()
++
++# NRO is a single static binary; there are no shared libraries on Horizon.
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    add_library(rexruntime STATIC ${REXSYSTEM_SOURCES})
++else()
++    add_library(rexruntime SHARED ${REXSYSTEM_SOURCES})
++endif()
+ add_library(rex::runtime ALIAS rexruntime)
+ add_library(rex::system ALIAS rexruntime)
+ add_library(rex::kernel ALIAS rexruntime)
+@@ -83,12 +93,14 @@ target_link_libraries(rexruntime
+         fmt::fmt
+         spdlog::spdlog
+         tomlplusplus
+-        SDL3::SDL3
+     PRIVATE
+         aes128
+         mspack
+         xxHash::xxhash
+ )
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    target_link_libraries(rexruntime PUBLIC SDL3::SDL3)
++endif()
+ 
+ if(REXGLUE_ENABLE_TRACY)
+     # TARGET_NAME is what tells install(EXPORT) this text is a target to
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 3733ea5..8831528 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -76,6 +76,13 @@ elseif(ANDROID)
+     set(REXUI_PLATFORM_SOURCES
+         surface_android.cpp
+     )
++elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    # No SDL windowing on Switch; the VI surface arrives with the NVK presenter.
++    set(REXUI_PLATFORM_SOURCES
++        surface_switch.cpp
++        window_switch.cpp
++        windowed_app_context_switch.cpp
++    )
+ else()
+     set(REXUI_PLATFORM_SOURCES
+         surface_gnulinux.cpp
+@@ -83,13 +90,30 @@ else()
+ endif()
+ 
+ # Combine sources
+-set(REXUI_SOURCES
+-    ${REXUI_CORE_SOURCES}
+-    ${REXUI_OVERLAY_SOURCES}
+-    ${REXUI_PLATFORM_SOURCES}
+-)
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    # Headless subset: no SDL, no graphics-API presenters. window_sdl.cpp and
++    # windowed_app_context_sdl.cpp are replaced by the Switch variants above.
++    list(REMOVE_ITEM REXUI_CORE_SOURCES
++        sdl_virtual_key.cpp
++        window_sdl.cpp
++        windowed_app_context_sdl.cpp
++        renderdoc_api.cpp
++    )
++    set(REXUI_SOURCES
++        ${REXUI_CORE_SOURCES}
++        ${REXUI_PLATFORM_SOURCES}
++    )
++else()
++    set(REXUI_SOURCES
++        ${REXUI_CORE_SOURCES}
++        ${REXUI_OVERLAY_SOURCES}
++        ${REXUI_PLATFORM_SOURCES}
++    )
++endif()
+ 
+-if(REXGLUE_USE_VULKAN)
++# The Vulkan UI presenter is built around SDL surfaces; Switch renders through
++# the game's native renderer hooks instead, so keep the sources out.
++if(REXGLUE_USE_VULKAN AND NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+     list(APPEND REXUI_SOURCES ${REXUI_VULKAN_SOURCES})
+ endif()
+ 
+@@ -112,12 +136,16 @@ target_include_directories(rexui PRIVATE
+     ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for icon decoding
+ )
+ 
+-target_link_libraries(rexui PUBLIC
+-    rexcore
+-    renderdoc
+-    imgui::imgui
+-    SDL3::SDL3
+-)
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    target_link_libraries(rexui PUBLIC rexcore imgui::imgui)
++else()
++    target_link_libraries(rexui PUBLIC
++        rexcore
++        renderdoc
++        imgui::imgui
++        SDL3::SDL3
++    )
++endif()
+ target_link_libraries(rexui PRIVATE utf8cpp)
+ 
+ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
+diff --git a/src/ui/surface_switch.cpp b/src/ui/surface_switch.cpp
+new file mode 100644
+index 0000000..82dc00e
+--- /dev/null
++++ b/src/ui/surface_switch.cpp
+@@ -0,0 +1,13 @@
++/**
++ * @file        ui/surface_switch.cpp
++ * @brief       Nintendo Switch surface (header-only for now)
++ */
++
++#include <rex/ui/surface_switch.h>
++
++namespace rex::ui {
++
++// SwitchSurface is fully inline while it is a headless stand-in. The NVK/VI
++// implementation will live here once the presenter lands.
++
++}  // namespace rex::ui
+diff --git a/src/ui/window_switch.cpp b/src/ui/window_switch.cpp
+new file mode 100644
+index 0000000..4fc3d43
+--- /dev/null
++++ b/src/ui/window_switch.cpp
+@@ -0,0 +1,66 @@
++/**
++ * @file        ui/window_switch.cpp
++ * @brief       Headless Nintendo Switch Window implementation
++ */
++
++#include <rex/ui/window_switch.h>
++
++#include <rex/logging.h>
++#include <rex/ui/surface_switch.h>
++
++namespace rex::ui {
++
++// Platform factory used by WindowedApp.
++std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
++                                       std::string_view title,
++                                       uint32_t desired_logical_width,
++                                       uint32_t desired_logical_height) {
++  return std::make_unique<WindowSwitch>(app_context, title, desired_logical_width,
++                                        desired_logical_height);
++}
++
++WindowSwitch::WindowSwitch(WindowedAppContext& app_context, std::string_view title,
++                           uint32_t desired_logical_width,
++                           uint32_t desired_logical_height)
++    : Window(app_context, title, desired_logical_width, desired_logical_height) {}
++
++WindowSwitch::~WindowSwitch() { EnterDestructor(); }
++
++bool WindowSwitch::OpenImpl() {
++  // No native window on Horizon: the app owns the whole display. Report the
++  // desired size as actual and take focus immediately so the common Window
++  // code considers the window fully open.
++  WindowDestructionReceiver destruction_receiver(this);
++  OnActualSizeUpdate(GetDesiredLogicalWidth(), GetDesiredLogicalHeight(),
++                     destruction_receiver);
++  if (destruction_receiver.IsWindowDestroyed()) {
++    return true;
++  }
++  OnFocusUpdate(true, destruction_receiver);
++  return true;
++}
++
++void WindowSwitch::RequestCloseImpl() {
++  WindowDestructionReceiver destruction_receiver(this);
++  OnBeforeClose(destruction_receiver);
++  if (destruction_receiver.IsWindowDestroyed()) {
++    return;
++  }
++  // No native window to destroy between OnBeforeClose and OnAfterClose.
++  OnAfterClose();
++}
++
++std::unique_ptr<Surface> WindowSwitch::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
++  if (!(allowed_types & Surface::kTypeFlag_SwitchVi)) {
++    REXLOG_ERROR("Presenter requested surface types {:#x}, Switch supports only VI",
++                 allowed_types);
++    return nullptr;
++  }
++  return std::make_unique<SwitchSurface>();
++}
++
++void WindowSwitch::RequestPaintImpl() {
++  // No compositor to poke; the NVK presenter will drive frames itself.
++}
++
++}  // namespace rex::ui
+diff --git a/src/ui/windowed_app_context_switch.cpp b/src/ui/windowed_app_context_switch.cpp
+new file mode 100644
+index 0000000..cc1449d
+--- /dev/null
++++ b/src/ui/windowed_app_context_switch.cpp
+@@ -0,0 +1,40 @@
++/**
++ * @file        ui/windowed_app_context_switch.cpp
++ * @brief       Nintendo Switch UI loop context
++ */
++
++#include <rex/ui/windowed_app_context_switch.h>
++
++#include <cstdlib>
++
++namespace rex::ui {
++
++SwitchWindowedAppContext::~SwitchWindowedAppContext() {
++  // Execute leftover pending functions before the loop machinery goes away,
++  // mirroring the shutdown contract documented in WindowedAppContext.
++  ExecutePendingFunctionsFromUIThread();
++}
++
++void SwitchWindowedAppContext::NotifyUILoopOfPendingFunctions() {
++  loop_cv_.notify_one();
++}
++
++void SwitchWindowedAppContext::PlatformQuitFromUIThread() {
++  // The loop re-checks HasQuitFromUIThread after every wakeup; make sure one
++  // is delivered even if the pending queue was empty.
++  NotifyUILoopOfPendingFunctions();
++}
++
++int SwitchWindowedAppContext::RunMainMessageLoop() {
++  while (!HasQuitFromUIThread()) {
++    ExecutePendingFunctionsFromUIThread();
++    if (HasQuitFromUIThread()) {
++      break;
++    }
++    std::unique_lock<std::mutex> lock(loop_mutex_);
++    loop_cv_.wait_for(lock, std::chrono::milliseconds(50));
++  }
++  return EXIT_SUCCESS;
++}
++
++}  // namespace rex::ui
+diff --git a/src/ui/windowed_app_main_switch.cpp b/src/ui/windowed_app_main_switch.cpp
+new file mode 100644
+index 0000000..cc4b6db
+--- /dev/null
++++ b/src/ui/windowed_app_main_switch.cpp
+@@ -0,0 +1,91 @@
++/**
++ * @file        ui/windowed_app_main_switch.cpp
++ * @brief       Entry point for windowed applications (Nintendo Switch/libnx)
++ *
++ * No SDL and no OS message loop on Horizon: stderr goes to a log on the SD
++ * card, game data defaults to sdmc:/switch/RaymanOriginsRecomp/game, and the
++ * UI loop is the condition-variable loop in SwitchWindowedAppContext.
++ */
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/ui/windowed_app.h>
++#include <rex/ui/windowed_app_context_switch.h>
++
++namespace {
++
++constexpr const char* kSdRoot = "sdmc:/switch/RaymanOriginsRecomp";
++constexpr const char* kLogPath = "sdmc:/switch/RaymanOriginsRecomp/rayman.log";
++
++int RunWindowedApp(int argc, char** argv) {
++  auto remaining = rex::cvar::Init(argc, argv);
++  rex::cvar::ApplyEnvironment();
++  rex::InitLoggingEarly();
++
++  int result;
++  {
++    rex::ui::SwitchWindowedAppContext app_context;
++    if (!app_context.Initialize()) {
++      return EXIT_FAILURE;
++    }
++
++    std::unique_ptr<rex::ui::WindowedApp> app = rex::ui::GetWindowedAppCreator()(app_context);
++
++    const auto& option_names = app->GetPositionalOptions();
++    std::map<std::string, std::string> parsed;
++    size_t count = std::min(remaining.size(), option_names.size());
++    for (size_t i = 0; i < count; ++i) {
++      parsed[option_names[i]] = remaining[i];
++    }
++    app->SetParsedArguments(std::move(parsed));
++
++    result = app->OnInitialize() ? app_context.RunMainMessageLoop() : EXIT_FAILURE;
++
++    app->InvokeOnDestroy();
++  }
++
++  return result;
++}
++
++}  // namespace
++
++int main(int argc, char* argv[]) {
++  // No console on Horizon by default: route stderr to the SD card so crashes
++  // and [perf] lines are retrievable after the run.
++  std::string log_path = kLogPath;
++  for (int i = 1; i + 1 < argc; ++i) {
++    if (std::string_view(argv[i]) == "--log_file") {
++      log_path = argv[i + 1];
++    }
++  }
++  if (FILE* redirected = std::freopen(log_path.c_str(), "w", stderr)) {
++    setvbuf(redirected, nullptr, _IOLBF, BUFSIZ);
++  }
++
++  std::vector<std::string> args(argv, argv + argc);
++  auto has_arg = [&args](const char* name) {
++    return std::any_of(args.begin(), args.end(),
++                       [name](const std::string& a) { return a.rfind(name, 0) == 0; });
++  };
++  if (!has_arg("--game_data_root")) {
++    args.push_back(std::string("--game_data_root=") + kSdRoot + "/game");
++  }
++  if (!has_arg("--log_file")) {
++    args.push_back(std::string("--log_file=") + log_path);
++  }
++
++  std::vector<char*> argv_ptrs;
++  argv_ptrs.reserve(args.size());
++  for (auto& s : args) {
++    argv_ptrs.push_back(s.data());
++  }
++  return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
++}
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..599f282 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -41,9 +41,13 @@ set(REQUIRED_SUBMODULES
+     fmt
+     utfcpp
+     imgui
+-    sdl3
+ )
+ 
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    # SDL3 has no Switch port; Switch builds use nop/stub backends instead.
++    list(APPEND REQUIRED_SUBMODULES sdl3)
++endif()
++
+ if(REXGLUE_USE_VULKAN)
+     list(APPEND REQUIRED_SUBMODULES
+         vulkan-headers vulkan-memory-allocator
+@@ -301,7 +305,9 @@ if(UNIX AND NOT APPLE)
+     set(SDL_PIPEWIRE_SHARED   ON  CACHE BOOL "" FORCE)
+ endif()
+ 
+-add_subdirectory(sdl3)
++if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    add_subdirectory(sdl3)
++endif()
+ 
+ #=============================================================================
+ # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)
+@@ -339,7 +345,15 @@ if(REXGLUE_USE_VULKAN)
+ 
+     # Set policy minimum for older glslang versions with outdated cmake_minimum_required
+     set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
++    # glslang picks its OSDependent backend off UNIX, which devkitPro's
++    # platform module leaves unset; newlib+libnx cover the POSIX pieces.
++    if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++        set(UNIX TRUE)
++    endif()
+     add_subdirectory(glslang)
++    if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++        set(UNIX FALSE)
++    endif()
+     # Create alias for older glslang versions that don't provide it
+     if(NOT TARGET glslang::SPIRV)
+         add_library(glslang::SPIRV ALIAS SPIRV)
+diff --git a/thirdparty/crypto/sha256.cpp b/thirdparty/crypto/sha256.cpp
+index e96b4da..8e0a040 100644
+--- a/thirdparty/crypto/sha256.cpp
++++ b/thirdparty/crypto/sha256.cpp
+@@ -9,7 +9,8 @@
+ 
+ // big endian architectures need #define __BYTE_ORDER __BIG_ENDIAN
+ #ifndef _MSC_VER
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(__SWITCH__)
++// newlib has no <endian.h>; the compiler macros suffice.
+ #if !defined(__BYTE_ORDER) && defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__)
+ #define __BYTE_ORDER __BYTE_ORDER__
+ #define __BIG_ENDIAN __ORDER_BIG_ENDIAN__
+-- 
+2.54.0
+

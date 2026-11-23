@@ -1,0 +1,517 @@
+From ba4b38d5a599643be77cadf75c9b6ca650c28a00 Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 17:39:21 +0300
+Subject: [PATCH] Switch: guest memory backend (virtmem + process-memory SVCs),
+ MappedMemory, libnx exception handler
+
+physical_membase_ = virtual_membase_ + 0xA0000000 (no real aliasing on Horizon).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/rex/memory/utils.h            |   5 +
+ src/core/CMakeLists.txt               |   3 +
+ src/core/exception_handler_switch.cpp |  68 +++++++
+ src/core/mapped_memory_switch.cpp     |  71 +++++++
+ src/core/memory_switch.cpp            | 263 ++++++++++++++++++++++++++
+ src/system/xmemory.cpp                |  17 ++
+ 6 files changed, 427 insertions(+)
+ create mode 100644 src/core/exception_handler_switch.cpp
+ create mode 100644 src/core/mapped_memory_switch.cpp
+ create mode 100644 src/core/memory_switch.cpp
+
+diff --git a/include/rex/memory/utils.h b/include/rex/memory/utils.h
+index 8ccb52c..877ead1 100644
+--- a/include/rex/memory/utils.h
++++ b/include/rex/memory/utils.h
+@@ -57,6 +57,11 @@ void AndroidShutdown();
+ 
+ // Returns the native page size of the system, in bytes.
+ // This should be ~4KiB.
++#if REX_PLATFORM_SWITCH
++// Reserves the guest address window on Horizon (memory_switch.cpp).
++uint8_t* SwitchReserveGuestWindow(size_t size);
++#endif
++
+ size_t page_size();
+ 
+ // Returns the allocation granularity of the system, in bytes.
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index dd3a69a..aafea89 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -61,6 +61,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+         clock_posix.cpp
+         dbg_posix.cpp
+         dynlib_switch.cpp
++        exception_handler_switch.cpp
+         filesystem_posix.cpp
+         math_gcc.cpp
+         platform/console_posix.cpp
+@@ -69,6 +70,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+         system_posix.cpp
+         fiber_posix.cpp
+         libc_stubs_switch.cpp
++        mapped_memory_switch.cpp
++        memory_switch.cpp
+         threading_posix.cpp
+     )
+ elseif(UNIX)
+diff --git a/src/core/exception_handler_switch.cpp b/src/core/exception_handler_switch.cpp
+new file mode 100644
+index 0000000..9f069bb
+--- /dev/null
++++ b/src/core/exception_handler_switch.cpp
+@@ -0,0 +1,68 @@
++/**
++ * @file        core/exception_handler_switch.cpp
++ * @brief       Nintendo Switch exception handling (libnx)
++ *
++ * Horizon delivers CPU faults to __libnx_exception_handler on a dedicated
++ * stack. Faults cannot be resumed here, so rex handlers (MMIO, write watch)
++ * are only stored; the libnx handler writes a crash report and the process
++ * terminates. Crash log: sdmc:/switch/RaymanOriginsRecomp/crash.log
++ */
++
++#include <rex/platform.h>
++#include <rex/exception_handler.h>
++
++static_assert(REX_PLATFORM_SWITCH, "This file is Nintendo Switch-only");
++
++#include <switch.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <mutex>
++#include <utility>
++#include <vector>
++
++namespace rex::arch {
++namespace {
++std::mutex g_mutex;
++std::vector<std::pair<ExceptionHandler::Handler, void*>> g_handlers;
++}  // namespace
++
++void ExceptionHandler::Install(Handler fn, void* data) {
++  std::lock_guard<std::mutex> lock(g_mutex);
++  g_handlers.emplace_back(fn, data);
++}
++
++void ExceptionHandler::Uninstall(Handler fn, void* data) {
++  std::lock_guard<std::mutex> lock(g_mutex);
++  g_handlers.erase(std::remove(g_handlers.begin(), g_handlers.end(), std::make_pair(fn, data)),
++                   g_handlers.end());
++}
++
++}  // namespace rex::arch
++
++extern "C" {
++alignas(16) uint8_t __nx_exception_stack[0x8000];
++uint64_t __nx_exception_stack_size = sizeof(__nx_exception_stack);
++
++extern void _start();
++
++void __libnx_exception_handler(ThreadExceptionDump* dump) {
++  FILE* file = fopen("sdmc:/switch/RaymanOriginsRecomp/crash.log", "w");
++  if (!file) return;
++  const uint64_t image = reinterpret_cast<uint64_t>(&_start);
++  fprintf(file, "Rayman Origins Recompiled - Switch exception\n");
++  fprintf(file, "error_desc=0x%08X esr=0x%08X\n", dump->error_desc, dump->esr);
++  fprintf(file, "image_base=0x%016llX\n", (unsigned long long)image);
++  fprintf(file, "pc=0x%016llX (offset 0x%llX)\n", (unsigned long long)dump->pc.x,
++          (unsigned long long)(dump->pc.x - image));
++  fprintf(file, "lr=0x%016llX (offset 0x%llX)\n", (unsigned long long)dump->lr.x,
++          (unsigned long long)(dump->lr.x - image));
++  fprintf(file, "sp=0x%016llX fp=0x%016llX far=0x%016llX\n", (unsigned long long)dump->sp.x,
++          (unsigned long long)dump->fp.x, (unsigned long long)dump->far.x);
++  for (unsigned i = 0; i < 29; ++i) {
++    fprintf(file, "x%u=0x%016llX\n", i, (unsigned long long)dump->cpu_gprs[i].x);
++  }
++  fclose(file);
++}
++}  // extern "C"
+diff --git a/src/core/mapped_memory_switch.cpp b/src/core/mapped_memory_switch.cpp
+new file mode 100644
+index 0000000..f774c15
+--- /dev/null
++++ b/src/core/mapped_memory_switch.cpp
+@@ -0,0 +1,71 @@
++/**
++ * @file        core/mapped_memory_switch.cpp
++ * @brief       Nintendo Switch: MappedMemory without mmap
++ *
++ * Files are read into a heap buffer (read-only use is the common case).
++ * kReadWrite changes are written back on Flush()/Close().
++ */
++
++#include <rex/platform.h>
++#include <rex/memory/mapped_memory.h>
++
++static_assert(REX_PLATFORM_SWITCH, "This file is Nintendo Switch-only");
++
++#include <cstdio>
++#include <vector>
++
++namespace rex::memory {
++namespace {
++
++class BufferedMappedMemory : public MappedMemory {
++ public:
++  BufferedMappedMemory(std::filesystem::path path, Mode mode, size_t offset,
++                       std::vector<uint8_t> buffer)
++      : path_(std::move(path)), mode_(mode), offset_(offset), buffer_(std::move(buffer)) {
++    data_ = buffer_.data();
++    size_ = buffer_.size();
++  }
++  ~BufferedMappedMemory() override { Write(); }
++
++  void Close(uint64_t /*truncate_size*/) override { Write(); }
++  void Flush() override { Write(); }
++
++ private:
++  void Write() {
++    if (mode_ != Mode::kReadWrite || buffer_.empty()) return;
++    if (FILE* f = std::fopen(path_.string().c_str(), "r+b")) {
++      std::fseek(f, static_cast<long>(offset_), SEEK_SET);
++      std::fwrite(buffer_.data(), 1, buffer_.size(), f);
++      std::fclose(f);
++    }
++  }
++
++  std::filesystem::path path_;
++  Mode mode_;
++  size_t offset_;
++  std::vector<uint8_t> buffer_;
++};
++
++}  // namespace
++
++std::unique_ptr<MappedMemory> MappedMemory::Open(const std::filesystem::path& path, Mode mode,
++                                                 size_t offset, size_t length) {
++  FILE* f = std::fopen(path.string().c_str(), "rb");
++  if (!f) return nullptr;
++  std::fseek(f, 0, SEEK_END);
++  const size_t file_size = static_cast<size_t>(std::ftell(f));
++  if (offset > file_size) {
++    std::fclose(f);
++    return nullptr;
++  }
++  size_t n = length ? length : file_size - offset;
++  if (offset + n > file_size) n = file_size - offset;
++  std::vector<uint8_t> buffer(n);
++  std::fseek(f, static_cast<long>(offset), SEEK_SET);
++  const size_t got = std::fread(buffer.data(), 1, n, f);
++  std::fclose(f);
++  if (got != n) return nullptr;
++  return std::make_unique<BufferedMappedMemory>(path, mode, offset, std::move(buffer));
++}
++
++}  // namespace rex::memory
+diff --git a/src/core/memory_switch.cpp b/src/core/memory_switch.cpp
+new file mode 100644
+index 0000000..0695a74
+--- /dev/null
++++ b/src/core/memory_switch.cpp
+@@ -0,0 +1,263 @@
++/**
++ * @file        core/memory_switch.cpp
++ * @brief       Nintendo Switch (Horizon) guest-memory backend
++ *
++ * Horizon has no mmap(). The guest address window is reserved with libnx's
++ * virtmem and then populated page-run by page-run:
++ *
++ *   backing = memalign(4K)                      (zeroed)
++ *   alias   = svcMapProcessCodeMemory(backing)  (RW alias, backing becomes unusable)
++ *   guest   = svcMapProcessMemory(alias)        (alias becomes unusable)
++ *
++ * This is the sequence validated on hardware by the upstream `switch` branch
++ * (runtime/memory.cpp). A page can be visible at ONE address only, so the
++ * Xbox 360 mirror views are not real aliases: Memory::Initialize places
++ * physical_membase_ at virtual_membase_ + 0xA0000000 instead, which makes
++ * the 64K-page physical view and the raw physical view the same bytes.
++ *
++ * Limitations (TODO): Protect() is not enforced, decommit zeroes but does not
++ * give pages back, no write-watch/MMIO trapping (no signals on Horizon).
++ */
++
++#include <rex/platform.h>
++#include <rex/memory/utils.h>
++
++static_assert(REX_PLATFORM_SWITCH, "This file is Nintendo Switch-only");
++
++#include <switch.h>
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <malloc.h>
++#include <mutex>
++#include <vector>
++
++#include <rex/logging.h>
++
++namespace rex::memory {
++namespace {
++
++constexpr size_t kPage = 0x1000;
++// Commit runs are widened to this granularity to keep the number of kernel
++// memory blocks down (Horizon limits mappings per process).
++constexpr size_t kCommitChunk = 0x10000;
++
++struct Window {
++  uint8_t* base = nullptr;
++  size_t size = 0;
++  std::vector<uint8_t> committed;  // one byte per 4 KiB page
++};
++
++std::mutex g_mutex;
++Window g_window;
++
++inline size_t AlignDown(size_t v, size_t a) { return v & ~(a - 1); }
++inline size_t AlignUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
++
++// Maps zeroed, RW memory for [offset, offset+size) of the window.
++bool MapRun(size_t offset, size_t size) {
++  uint8_t* dest = g_window.base + offset;
++
++  void* backing = memalign(kPage, size);
++  if (!backing) {
++    REXSYS_ERROR("memory_switch: backing allocation of 0x{:X} bytes failed", size);
++    return false;
++  }
++  std::memset(backing, 0, size);
++
++  virtmemLock();
++  void* alias = virtmemFindCodeMemory(size, kPage);
++  Result rc = 0;
++  bool alias_mapped = false;
++  if (alias) {
++    rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), reinterpret_cast<u64>(alias),
++                                 reinterpret_cast<u64>(backing), size);
++    if (R_SUCCEEDED(rc)) {
++      alias_mapped = true;
++      rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(), reinterpret_cast<u64>(alias),
++                                         size, Perm_Rw);
++    }
++  }
++  virtmemUnlock();
++
++  if (!alias) {
++    REXSYS_ERROR("memory_switch: virtmemFindCodeMemory(0x{:X}) failed", size);
++    free(backing);
++    return false;
++  }
++  if (R_FAILED(rc)) {
++    REXSYS_ERROR("memory_switch: code-memory alias failed: 0x{:X}", rc);
++    if (alias_mapped) {
++      svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), reinterpret_cast<u64>(alias),
++                                reinterpret_cast<u64>(backing), size);
++    }
++    free(backing);
++    return false;
++  }
++
++  rc = svcMapProcessMemory(dest, envGetOwnProcessHandle(), reinterpret_cast<u64>(alias), size);
++  if (R_FAILED(rc)) {
++    REXSYS_ERROR("memory_switch: svcMapProcessMemory(guest+0x{:X}, 0x{:X}) failed: 0x{:X}", offset,
++                 size, rc);
++    svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), reinterpret_cast<u64>(alias),
++                              reinterpret_cast<u64>(backing), size);
++    free(backing);
++    return false;
++  }
++  // Backing/alias stay owned by the kernel mapping for the process lifetime.
++  return true;
++}
++
++bool CommitRange(size_t offset, size_t length) {
++  if (length == 0) return true;
++  size_t begin = AlignDown(offset, kCommitChunk);
++  size_t end = AlignUp(offset + length, kCommitChunk);
++  if (end > g_window.size) end = g_window.size;
++  if (begin >= end) return false;
++
++  size_t page = begin / kPage;
++  const size_t end_page = end / kPage;
++  while (page < end_page) {
++    if (g_window.committed[page]) {
++      ++page;
++      continue;
++    }
++    size_t run_end = page;
++    while (run_end < end_page && !g_window.committed[run_end]) ++run_end;
++    if (!MapRun(page * kPage, (run_end - page) * kPage)) return false;
++    for (size_t i = page; i < run_end; ++i) g_window.committed[i] = 1;
++    page = run_end;
++  }
++  return true;
++}
++
++bool InWindow(void* address, size_t length, size_t* out_offset) {
++  auto a = reinterpret_cast<uint8_t*>(address);
++  if (!g_window.base || a < g_window.base) return false;
++  size_t off = static_cast<size_t>(a - g_window.base);
++  if (off + length > g_window.size) return false;
++  *out_offset = off;
++  return true;
++}
++
++}  // namespace
++
++// Reserves the guest address window (called from Memory::Initialize).
++uint8_t* SwitchReserveGuestWindow(size_t size) {
++  std::lock_guard<std::mutex> lock(g_mutex);
++  if (g_window.base) return g_window.base;
++
++  if (!envIsSyscallHinted(0x74) || !envIsSyscallHinted(0x75) || !envIsSyscallHinted(0x77) ||
++      !envIsSyscallHinted(0x78)) {
++    REXSYS_ERROR(
++        "memory_switch: process-memory SVCs are not available (run as a title/full-RAM app, not "
++        "from applet mode)");
++    return nullptr;
++  }
++
++  virtmemLock();
++  void* base = virtmemFindAslr(size, kPage);
++  VirtmemReservation* reservation = base ? virtmemAddReservation(base, size) : nullptr;
++  virtmemUnlock();
++  if (!base || !reservation) {
++    REXSYS_ERROR("memory_switch: reserving a 0x{:X}-byte window failed", size);
++    return nullptr;
++  }
++  g_window.base = static_cast<uint8_t*>(base);
++  g_window.size = size;
++  g_window.committed.assign(size / kPage, 0);
++  REXSYS_INFO("memory_switch: guest window 0x{:016X}..+0x{:X}", reinterpret_cast<uintptr_t>(base),
++              size);
++  return g_window.base;
++}
++
++size_t page_size() { return kPage; }
++size_t allocation_granularity() { return kPage; }
++
++bool IsWritableExecutableMemorySupported() { return false; }
++
++void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
++                 PageAccess access) {
++  (void)access;
++  std::lock_guard<std::mutex> lock(g_mutex);
++  if (!base_address) {
++    // Host-side allocation outside the guest window.
++    void* p = memalign(kPage, AlignUp(length, kPage));
++    if (p) std::memset(p, 0, length);
++    return p;
++  }
++  size_t off;
++  if (!InWindow(base_address, length, &off)) {
++    return nullptr;
++  }
++  // Reserve is implicit (the whole window is reserved); commit maps pages.
++  if (static_cast<uint32_t>(allocation_type) & static_cast<uint32_t>(AllocationType::kCommit)) {
++    if (!CommitRange(off, length)) return nullptr;
++  }
++  return base_address;
++}
++
++bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocation_type) {
++  std::lock_guard<std::mutex> lock(g_mutex);
++  size_t off;
++  if (!InWindow(base_address, length, &off)) {
++    return true;  // not ours (host allocation): leak rather than free a non-owned pointer
++  }
++  (void)deallocation_type;
++  // Pages stay mapped; zero what was committed so a later commit reads as fresh.
++  size_t begin = AlignDown(off, kPage);
++  size_t end = AlignUp(off + length, kPage);
++  for (size_t p = begin / kPage; p < end / kPage; ++p) {
++    if (g_window.committed[p]) {
++      std::memset(g_window.base + p * kPage, 0, kPage);
++    }
++  }
++  return true;
++}
++
++bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* out_old_access) {
++  (void)base_address;
++  (void)length;
++  (void)access;
++  // TODO(switch): enforce via svcSetProcessMemoryPermission where needed.
++  if (out_old_access) *out_old_access = PageAccess::kReadWrite;
++  return true;
++}
++
++bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
++  std::lock_guard<std::mutex> lock(g_mutex);
++  size_t off;
++  if (!InWindow(base_address, 1, &off)) return false;
++  access_out =
++      g_window.committed[off / kPage] ? PageAccess::kReadWrite : PageAccess::kNoAccess;
++  size_t p = off / kPage;
++  const bool state = g_window.committed[p] != 0;
++  size_t n = 0;
++  while (p < g_window.committed.size() && (g_window.committed[p] != 0) == state) {
++    ++p;
++    n += kPage;
++  }
++  length = n;
++  return true;
++}
++
++// The "file mapping" is only a token: the pages are provided by AllocFixed.
++FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& /*path*/, size_t /*length*/,
++                                          PageAccess /*access*/, bool /*commit*/) {
++  return 1;
++}
++
++void CloseFileMappingHandle(FileMappingHandle /*handle*/, const std::filesystem::path& /*path*/) {}
++
++void* MapFileView(FileMappingHandle /*handle*/, void* base_address, size_t /*length*/,
++                  PageAccess /*access*/, size_t /*file_offset*/) {
++  // Views are not real aliases on Horizon (see file comment).
++  return base_address;
++}
++
++bool UnmapFileView(FileMappingHandle /*handle*/, void* /*base_address*/, size_t /*length*/) {
++  return true;
++}
++
++}  // namespace rex::memory
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..21c0327 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -157,6 +157,17 @@ bool Memory::Initialize() {
+     return false;
+   }
+   mapping_base_ = views_.all_views[0];
++#elif REX_PLATFORM_SWITCH
++  // Horizon: the 4 GB guest window comes from libnx virtmem; views are not
++  // real aliases (see core/memory_switch.cpp).
++  {
++    uint8_t* window = rex::memory::SwitchReserveGuestWindow(0x100000000ull);
++    if (!window || MapViews(window)) {
++      REXSYS_ERROR("Unable to reserve the 4gb guest address space (Switch).");
++      return false;
++    }
++    mapping_base_ = window;
++  }
+ #else
+   // Attempt to create our views. This may fail at the first address
+   // we pick, so try a few times.
+@@ -175,7 +186,13 @@ bool Memory::Initialize() {
+   }
+ #endif
+   virtual_membase_ = mapping_base_;
++#if REX_PLATFORM_SWITCH
++  // No real aliasing on Horizon: make the raw physical view coincide with the
++  // 64K-page physical view (0xA0000000), so host and guest see the same bytes.
++  physical_membase_ = mapping_base_ + 0xA0000000ull;
++#else
+   physical_membase_ = mapping_base_ + 0x100000000ull;
++#endif
+ 
+   REXSYS_INFO("Guest memory arena mapped: virtual base 0x{:016X}, physical base 0x{:016X}",
+               reinterpret_cast<uintptr_t>(virtual_membase_),
+-- 
+2.54.0
+

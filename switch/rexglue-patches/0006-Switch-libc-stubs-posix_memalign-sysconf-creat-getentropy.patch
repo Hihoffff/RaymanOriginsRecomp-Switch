@@ -1,0 +1,66 @@
+From b29a6f09b1c519d9c57185b19c84c49b9df11f84 Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 17:51:09 +0300
+Subject: [PATCH] Switch: posix_memalign, sysconf, creat, getentropy stubs
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/core/libc_stubs_switch.cpp | 35 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/src/core/libc_stubs_switch.cpp b/src/core/libc_stubs_switch.cpp
+index 49a4e27..e31e6a9 100644
+--- a/src/core/libc_stubs_switch.cpp
++++ b/src/core/libc_stubs_switch.cpp
+@@ -11,6 +11,10 @@
+ static_assert(REX_PLATFORM_SWITCH, "This file is Nintendo Switch-only");
+ 
+ #include <errno.h>
++#include <fcntl.h>
++#include <malloc.h>
++#include <reent.h>
++#include <switch.h>
+ #include <pwd.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -19,6 +23,37 @@ static_assert(REX_PLATFORM_SWITCH, "This file is Nintendo Switch-only");
+ 
+ extern "C" {
+ 
++// newlib/libnx lack these; used by libavutil, filesystem_posix and libc++.
++int posix_memalign(void** out, size_t alignment, size_t size) {
++  void* p = memalign(alignment, size);
++  if (!p) return ENOMEM;
++  *out = p;
++  return 0;
++}
++
++long sysconf(int name) {
++  switch (name) {
++    case _SC_NPROCESSORS_ONLN:
++    case _SC_NPROCESSORS_CONF:
++      return 4;
++    case _SC_PAGESIZE:
++      return 0x1000;
++    default:
++      errno = EINVAL;
++      return -1;
++  }
++}
++
++int creat(const char* path, mode_t mode) {
++  return open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
++}
++
++int _getentropy_r(struct _reent* r, void* buf, size_t len) {
++  (void)r;
++  randomGet(buf, len);
++  return 0;
++}
++
+ int execvp(const char* /*file*/, char* const /*argv*/[]) {
+   errno = ENOSYS;
+   return -1;
+-- 
+2.54.0
+

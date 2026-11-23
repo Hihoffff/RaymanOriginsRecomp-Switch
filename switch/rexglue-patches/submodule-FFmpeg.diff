@@ -1,0 +1,18 @@
+diff --git a/config.h b/config.h
+index b6a504a887..dafc24ed39 100644
+--- a/config.h
++++ b/config.h
+@@ -24,6 +24,12 @@
+ #else
+ #error "android arch unsupported"
+ #endif
++#elif defined(__SWITCH__)
++#if defined(__aarch64__)
++#include "config_switch_aarch64.h"
++#else
++#error "switch arch unsupported"
++#endif
+ #else
+ #error "no config"
+ #endif
+\ No newline at end of file

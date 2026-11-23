@@ -1,0 +1,289 @@
+From 3a6d8453ac82bb357860a53126efd11f13a432ec Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 23:39:44 +0300
+Subject: [PATCH] Switch: silent audio driver (NopAudioDriver), kernel call
+ tracing hooks (off by default)
+
+---
+ src/audio/nop/nop_audio_system.cpp         | 60 ++++++++++++++++++++--
+ src/kernel/xboxkrnl/xboxkrnl_ob.cpp        |  5 ++
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp | 38 ++++++++++++++
+ 3 files changed, 98 insertions(+), 5 deletions(-)
+
+diff --git a/src/audio/nop/nop_audio_system.cpp b/src/audio/nop/nop_audio_system.cpp
+index e479311..e9995fd 100644
+--- a/src/audio/nop/nop_audio_system.cpp
++++ b/src/audio/nop/nop_audio_system.cpp
+@@ -9,11 +9,58 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <chrono>
++#include <thread>
++
++#include <rex/audio/audio_driver.h>
+ #include <rex/audio/flags.h>
+ #include <rex/audio/nop/nop_audio_system.h>
++#include <rex/logging.h>
+ 
+ namespace rex::audio::nop {
+ 
++// Silent driver: accepts the guest's audio frames, discards them and releases
++// the guest semaphore at the real-time frame rate (256 samples @ 48 kHz), so
++// the guest audio render thread keeps running without any output device.
++class NopAudioDriver : public AudioDriver {
++ public:
++  NopAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
++      : AudioDriver(memory), semaphore_(semaphore) {
++    worker_ = std::thread([this] {
++      auto next = std::chrono::steady_clock::now();
++      while (!stop_.load()) {
++        next += std::chrono::microseconds(5333);
++        std::this_thread::sleep_until(next);
++        if (pending_.load() > 0) {
++          pending_.fetch_sub(1);
++          semaphore_->Release(1, nullptr);
++        }
++      }
++    });
++  }
++  ~NopAudioDriver() override { Shutdown(); }
++
++  void SubmitFrame(uint32_t /*samples_ptr*/) override {
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true)) {
++      REXAPU_INFO("nop-audio: first frame submitted");
++    }
++    pending_.fetch_add(1);
++  }
++
++  void Shutdown() {
++    stop_.store(true);
++    if (worker_.joinable()) worker_.join();
++  }
++
++ private:
++  rex::thread::Semaphore* semaphore_;
++  std::atomic<bool> stop_{false};
++  std::atomic<int> pending_{0};
++  std::thread worker_;
++};
++
+ std::unique_ptr<AudioSystem> NopAudioSystem::Create(
+     runtime::FunctionDispatcher* function_dispatcher) {
+   return std::make_unique<NopAudioSystem>(function_dispatcher);
+@@ -24,14 +71,17 @@ NopAudioSystem::NopAudioSystem(runtime::FunctionDispatcher* function_dispatcher)
+ 
+ NopAudioSystem::~NopAudioSystem() = default;
+ 
+-X_STATUS NopAudioSystem::CreateDriver(size_t /*index*/, rex::thread::Semaphore* /*semaphore*/,
+-                                      AudioDriver** /*out_driver*/) {
+-  return X_STATUS_NOT_IMPLEMENTED;
++X_STATUS NopAudioSystem::CreateDriver(size_t /*index*/, rex::thread::Semaphore* semaphore,
++                                      AudioDriver** out_driver) {
++  REXAPU_INFO("nop-audio: creating silent driver");
++  *out_driver = new NopAudioDriver(memory_, semaphore);
++  return X_STATUS_SUCCESS;
+ }
+ 
+ void NopAudioSystem::DestroyDriver(AudioDriver* driver) {
+-  (void)driver;
+-  assert_always();
++  auto* d = dynamic_cast<NopAudioDriver*>(driver);
++  if (d) d->Shutdown();
++  delete driver;
+ }
+ 
+ }  // namespace rex::audio::nop
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_ob.cpp b/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
+index 5709e6d..6863ab2 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -26,6 +27,9 @@
+ #include <rex/system/xtypes.h>
+ 
+ namespace rex::kernel::xboxkrnl {
++extern std::atomic<bool> g_kdiag;
++#define KDIAG(name) do { if (g_kdiag.load()) { auto* _t = rex::system::XThread::GetCurrentThread(); REXKRNL_INFO("[kcall] {} thread={:08X} lr={:08X}", name, _t ? _t->handle() : 0u, _t ? uint32_t(_t->thread_state()->context()->lr) : 0u); } } while (0)
++
+ using namespace rex::system;
+ 
+ u32 ObOpenObjectByName_entry(mapped_void obj_attributes_ptr, mapped_void object_type_ptr, u32 unk,
+@@ -220,6 +224,7 @@ u32 NtDuplicateObject_entry(u32 handle, mapped_u32 new_handle_ptr, u32 options)
+ }
+ 
+ u32 NtClose_entry(u32 handle) {
++  KDIAG("NtClose");
+   REXKRNL_IMPORT_TRACE("NtClose", "handle={:#x}", (uint32_t)handle);
+   auto result = REX_KERNEL_OBJECTS()->ReleaseHandle(handle);
+   REXKRNL_IMPORT_RESULT("NtClose", "{:#x}", result);
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index aa4373f..25f1caf 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <rex/cvar.h>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+@@ -40,6 +41,20 @@
+ #include <rex/thread/mutex.h>
+ 
+ namespace rex::kernel::xboxkrnl {
++std::atomic<bool> g_kdiag{false};
++static void KDiagStack(rex::system::XThread* t) {
++  auto* c = t->thread_state()->context();
++  auto* mem = REX_KERNEL_MEMORY();
++  uint32_t r1 = uint32_t(c->r1.u64);
++  std::string out;
++  for (uint32_t i = 0; i < 1024; ++i) {
++    uint32_t v = rex::memory::load_and_swap<uint32_t>(mem->TranslateVirtual(r1 + 4 * i));
++    if (v >= 0x82120000 && v <= 0x829849B4 && (v & 3) == 0) out += fmt::format(" {:08X}@+{:X}", v, 4 * i);
++  }
++  REXKRNL_INFO("[kcall] stack scan (r1={:08X}):{}", r1, out);
++}
++#define KDIAG(name) do { if (g_kdiag.load()) { auto* _t = rex::system::XThread::GetCurrentThread(); REXKRNL_INFO("[kcall] {} thread={:08X} lr={:08X}", name, _t ? _t->handle() : 0u, _t ? uint32_t(_t->thread_state()->context()->lr) : 0u); if (_t && uint32_t(_t->thread_state()->context()->lr) == 0x825DE728) KDiagStack(_t); } } while (0)
++
+ using namespace rex::system;
+ using rex::runtime::current_ppc_context;
+ 
+@@ -130,6 +145,7 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
+         w += fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(p + 4 * i));
+       }
+     }
++    if (false) { g_kdiag.store(true); }
+     REXKRNL_INFO(
+         "[thread-diag] ExCreateThread start={:08X} context={:08X} flags={:X} stack={:X} words:{}",
+         start_address.guest_address(), start_context.guest_address(), (uint32_t)creation_flags,
+@@ -183,6 +199,7 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
+ }
+ 
+ u32 ExTerminateThread_entry(u32 exit_code) {
++  KDIAG("ExTerminateThread");
+   XThread* thread = XThread::GetCurrentThread();
+ 
+   // NOTE: this kills us right now. We won't return from it.
+@@ -489,10 +506,12 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+ }
+ 
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
++  KDIAG("KeSetEvent");
+   return xeKeSetEvent(event_ptr, increment, wait);
+ }
+ 
+ u32 KePulseEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
++  KDIAG("KePulseEvent");
+   auto ev = XObject::GetNativeObject<XEvent>(REX_KERNEL_STATE(), event_ptr);
+   if (!ev) {
+     assert_always();
+@@ -560,10 +579,12 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
+ }
+ 
+ u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
++  KDIAG("NtSetEvent");
+   return xeNtSetEvent(handle, previous_state_ptr);
+ }
+ 
+ u32 NtPulseEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
++  KDIAG("NtPulseEvent");
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
+@@ -629,6 +650,7 @@ uint32_t xeKeReleaseSemaphore(X_KSEMAPHORE* semaphore_ptr, uint32_t increment, u
+ 
+ u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 increment, u32 adjustment,
+                              u32 wait) {
++  KDIAG("KeReleaseSemaphore");
+   return xeKeReleaseSemaphore(semaphore_ptr, increment, adjustment, wait);
+ }
+ 
+@@ -671,6 +693,7 @@ u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_pt
+ }
+ 
+ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previous_count_ptr) {
++  KDIAG("NtReleaseSemaphore");
+   X_STATUS result = X_STATUS_SUCCESS;
+   int32_t previous_count = 0;
+ 
+@@ -854,6 +877,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+ 
+ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
+                                 u32 alertable, mapped_u64 timeout_ptr) {
++  KDIAG("KeWaitForSingleObject");
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
+   // timeout={}",
+@@ -868,12 +892,17 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
+ 
+ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
+                                   mapped_u64 timeout_ptr) {
++  KDIAG("NtWaitForSingleObjectEx");
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+   if (object) {
+     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
++    if (g_kdiag.load()) {
++      REXKRNL_INFO("[kcall] NtWaitForSingleObjectEx handle={:08X} type={} timeout_ptr={} -> {:08X}",
++                   object_handle, int(object->type()), timeout_ptr ? int64_t(timeout) : 0, uint32_t(result));
++    }
+     if (alertable && result == X_STATUS_USER_APC) {
+       XThread::GetCurrentThread()->DeliverAPCs();
+     }
+@@ -887,6 +916,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
+                                    u32 wait_reason, u32 processor_mode, u32 alertable,
+                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
++  KDIAG("KeWaitForMultipleObjects");
+   assert_true(wait_type <= 1);
+ 
+   std::vector<object_ref<XObject>> objects;
+@@ -894,6 +924,8 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
+     auto object_ptr = REX_KERNEL_MEMORY()->TranslateVirtual(objects_ptr[n]);
+     auto object_ref = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
+     if (!object_ref) {
++      REXKRNL_INFO("[kcall] KeWaitForMultipleObjects: object {} ptr={:08X} NOT RESOLVED -> INVALID_PARAMETER",
++                   n, uint32_t(objects_ptr[n]));
+       return X_STATUS_INVALID_PARAMETER;
+     }
+ 
+@@ -904,6 +936,10 @@ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_t
+   X_STATUS result = XObject::WaitMultiple(
+       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
+       processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
++  if (g_kdiag.load()) {
++    REXKRNL_INFO("[kcall] KeWaitForMultipleObjects returned {:08X} count={} wait_type={} timeout_ptr={}",
++                 uint32_t(result), count, wait_type, timeout_ptr ? int64_t(timeout) : 0);
++  }
+   if (alertable && result == X_STATUS_USER_APC) {
+     XThread::GetCurrentThread()->DeliverAPCs();
+   }
+@@ -935,6 +971,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
+ 
+ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
+                                      u32 alertable, mapped_u64 timeout_ptr) {
++  KDIAG("NtWaitForMultipleObjectsEx");
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
+                                       timeout_ptr ? &timeout : nullptr);
+@@ -942,6 +979,7 @@ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_typ
+ 
+ u32 NtSignalAndWaitForSingleObjectEx_entry(u32 signal_handle, u32 wait_handle, u32 alertable,
+                                            u32 r6, mapped_u64 timeout_ptr) {
++  KDIAG("NtSignalAndWaitForSingleObjectEx");
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   auto signal_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(signal_handle);
+-- 
+2.54.0
+

@@ -1,0 +1,479 @@
+From d07b8ee2e218e64c7b51f26fc3617b0aef225c16 Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 17:23:10 +0300
+Subject: [PATCH] Switch: threading on libnx pthread (no signals), fibers via
+ asm swap, dynlib stub, libc stubs
+
+Suspend/Terminate of other threads are cooperative stubs (TODO svcSetThreadActivity);
+affinity/priority/name are no-ops.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/rex/thread/fiber.h     |  6 +--
+ src/core/CMakeLists.txt        |  4 ++
+ src/core/dynlib_switch.cpp     | 37 +++++++++++++++++
+ src/core/fiber_posix.cpp       | 12 +++---
+ src/core/libc_stubs_switch.cpp | 69 +++++++++++++++++++++++++++++++
+ src/core/threading_posix.cpp   | 74 +++++++++++++++++++++++++++++-----
+ 6 files changed, 183 insertions(+), 19 deletions(-)
+ create mode 100644 src/core/dynlib_switch.cpp
+ create mode 100644 src/core/libc_stubs_switch.cpp
+
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index acc6f15..802ad90 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -14,7 +14,7 @@
+ #include <rex/platform.h>
+ #include <cstddef>
+ 
+-#if REX_PLATFORM_ANDROID
++#if REX_PLATFORM_ANDROID || REX_PLATFORM_SWITCH
+ #include <cstdint>
+ #include <vector>
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+@@ -59,8 +59,8 @@ struct Fiber {
+ #if REX_PLATFORM_WIN32
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
+-#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+-#if REX_PLATFORM_ANDROID
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH
++#if REX_PLATFORM_ANDROID || REX_PLATFORM_SWITCH
+   // Callee-saved state: x19-x30, sp, d8-d15.
+   struct Context {
+     uint64_t x[12];
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 409ec88..dd3a69a 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -60,12 +60,16 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+         atomic_posix.cpp
+         clock_posix.cpp
+         dbg_posix.cpp
++        dynlib_switch.cpp
+         filesystem_posix.cpp
+         math_gcc.cpp
+         platform/console_posix.cpp
+         platform/env_posix.cpp
+         seh_switch.cpp
+         system_posix.cpp
++        fiber_posix.cpp
++        libc_stubs_switch.cpp
++        threading_posix.cpp
+     )
+ elseif(UNIX)
+     # Linux and macOS/Darwin share the POSIX sources; Darwin-specific behavior
+diff --git a/src/core/dynlib_switch.cpp b/src/core/dynlib_switch.cpp
+new file mode 100644
+index 0000000..e95a0be
+--- /dev/null
++++ b/src/core/dynlib_switch.cpp
+@@ -0,0 +1,37 @@
++/**
++ * @file        core/dynlib_switch.cpp
++ * @brief       Nintendo Switch: no dynamic loading
++ *
++ * Horizon applications are a single static NRO; there is no dlopen.
++ * Load() always fails and callers fall back (GPU plugins and the Vulkan
++ * loader are linked statically on Switch).
++ */
++
++#include <rex/platform.h>
++#include <rex/platform/dynlib.h>
++
++static_assert(REX_PLATFORM_SWITCH, "This file is Nintendo Switch-only");
++
++namespace rex::platform {
++
++DynamicLibrary::~DynamicLibrary() = default;
++
++DynamicLibrary::DynamicLibrary(DynamicLibrary&& other) noexcept : handle_(other.handle_) {
++  other.handle_ = nullptr;
++}
++
++DynamicLibrary& DynamicLibrary::operator=(DynamicLibrary&& other) noexcept {
++  handle_ = other.handle_;
++  other.handle_ = nullptr;
++  return *this;
++}
++
++bool DynamicLibrary::Load(const std::filesystem::path& /*path*/, SymbolResolution /*mode*/) {
++  return false;
++}
++
++void* DynamicLibrary::GetRawSymbol(const char* /*name*/) const {
++  return nullptr;
++}
++
++}  // namespace rex::platform
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index cf74f07..4c0d6a9 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -17,15 +17,15 @@
+ #endif
+ 
+ #include <rex/platform.h>
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH
+ 
+ #include <rex/thread/fiber.h>
+ 
+ #include <cassert>
+ #include <cstdlib>
+ 
+-#if REX_PLATFORM_ANDROID
+-// Bionic has no ucontext switching. Save the AArch64 callee-saved registers of
++#if REX_PLATFORM_ANDROID || REX_PLATFORM_SWITCH
++// Bionic/newlib have no ucontext switching. Save the AArch64 callee-saved registers of
+ // `from` (x0) and load those of `to` (x1); `ret` then jumps to the loaded x30.
+ // Layout matches Fiber::Context: x19-x30 at 0, sp at 96, d8-d15 at 104.
+ // x18 is the platform register (shadow call stack) and is left untouched.
+@@ -69,7 +69,7 @@ namespace rex::thread {
+ 
+ thread_local Fiber* Fiber::tls_current_ = nullptr;
+ 
+-#if REX_PLATFORM_ANDROID
++#if REX_PLATFORM_ANDROID || REX_PLATFORM_SWITCH
+ 
+ Fiber* Fiber::ConvertCurrentThread() {
+   // The thread's registers are saved into context_ on its first SwitchTo.
+@@ -148,7 +148,7 @@ void Fiber::SwitchTo(Fiber* target) {
+   swapcontext(&from->context_, &target->context_);
+ }
+ 
+-#endif  // REX_PLATFORM_ANDROID
++#endif  // REX_PLATFORM_ANDROID || REX_PLATFORM_SWITCH
+ 
+ void Fiber::Destroy() {
+   // Thread fibers are destroyed from the owning thread itself.
+@@ -163,4 +163,4 @@ void Fiber::Destroy() {
+ 
+ }  // namespace rex::thread
+ 
+-#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH
+diff --git a/src/core/libc_stubs_switch.cpp b/src/core/libc_stubs_switch.cpp
+new file mode 100644
+index 0000000..49a4e27
+--- /dev/null
++++ b/src/core/libc_stubs_switch.cpp
+@@ -0,0 +1,69 @@
++/**
++ * @file        core/libc_stubs_switch.cpp
++ * @brief       Nintendo Switch: libc functions that newlib/libnx do not provide
++ *
++ * The core calls these in process-launch, user-folder and positional-I/O
++ * paths that either are not reachable on Horizon or can be emulated.
++ */
++
++#include <rex/platform.h>
++
++static_assert(REX_PLATFORM_SWITCH, "This file is Nintendo Switch-only");
++
++#include <errno.h>
++#include <pwd.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <mutex>
++
++extern "C" {
++
++int execvp(const char* /*file*/, char* const /*argv*/[]) {
++  errno = ENOSYS;
++  return -1;
++}
++
++pid_t waitpid(pid_t /*pid*/, int* /*status*/, int /*options*/) {
++  errno = ECHILD;
++  return -1;
++}
++
++uid_t getuid(void) {
++  return 0;
++}
++
++int getpwuid_r(uid_t /*uid*/, struct passwd* /*pwd*/, char* /*buf*/, size_t /*buflen*/,
++               struct passwd** result) {
++  *result = nullptr;
++  return ENOENT;
++}
++
++// pread/pwrite are emulated with lseek+read/write under a lock. They move the
++// shared file offset, so callers must not mix them with plain read/write on
++// the same descriptor from several threads.
++static std::mutex g_positional_io_mutex;
++
++ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
++  std::lock_guard<std::mutex> lock(g_positional_io_mutex);
++  const off_t saved = lseek(fd, 0, SEEK_CUR);
++  if (saved < 0 || lseek(fd, offset, SEEK_SET) < 0) {
++    return -1;
++  }
++  const ssize_t n = read(fd, buf, count);
++  lseek(fd, saved, SEEK_SET);
++  return n;
++}
++
++ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
++  std::lock_guard<std::mutex> lock(g_positional_io_mutex);
++  const off_t saved = lseek(fd, 0, SEEK_CUR);
++  if (saved < 0 || lseek(fd, offset, SEEK_SET) < 0) {
++    return -1;
++  }
++  const ssize_t n = write(fd, buf, count);
++  lseek(fd, saved, SEEK_SET);
++  return n;
++}
++
++}  // extern "C"
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 261d488..55d169c 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -9,7 +9,7 @@
+ #include <rex/platform.h>
+ #include <rex/thread.h>
+ 
+-static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
++static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC || REX_PLATFORM_SWITCH, "This file is POSIX-only");
+ 
+ #include <signal.h>
+ 
+@@ -31,7 +31,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ #include <fcntl.h>
+ #endif
++#if !REX_PLATFORM_SWITCH
+ #include <sys/syscall.h>
++#endif
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -116,7 +118,11 @@ enum class SignalType {
+ };
+ 
+ int GetSystemSignal(SignalType num) {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_SWITCH
++  // Horizon has no POSIX signals; see REX_THREAD_NO_SIGNALS.
++  (void)num;
++  return 0;
++#elif defined(__APPLE__)
+   // macOS has no realtime signals (SIGRTMIN..SIGRTMAX); map the runtime's
+   // signals onto the two user-defined signals.
+   switch (num) {
+@@ -136,7 +142,10 @@ int GetSystemSignal(SignalType num) {
+ }
+ 
+ SignalType GetSystemSignalType(int num) {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_SWITCH
++  (void)num;
++  return SignalType::kThreadSuspend;
++#elif defined(__APPLE__)
+   switch (num) {
+     case SIGUSR1:
+       return SignalType::kThreadSuspend;
+@@ -154,9 +163,15 @@ SignalType GetSystemSignalType(int num) {
+ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_handler_installed =
+     {};
+ 
++#if !REX_PLATFORM_SWITCH
+ static void signal_handler(int signal, siginfo_t* info, void* context);
++#endif
+ 
+ void install_signal_handler(SignalType type) {
++#if REX_PLATFORM_SWITCH
++  (void)type;  // no signals on Horizon
++  return;
++#else
+   bool expected = false;
+   if (!signal_handler_installed[static_cast<size_t>(type)].compare_exchange_strong(expected,
+                                                                                    true)) {
+@@ -169,6 +184,7 @@ void install_signal_handler(SignalType type) {
+   if (sigaction(GetSystemSignal(type), &action, nullptr) != 0) {
+     signal_handler_installed[static_cast<size_t>(type)] = false;
+   }
++#endif
+ }
+ 
+ // TODO(dougvj)
+@@ -177,7 +193,11 @@ void EnableAffinityConfiguration() {}
+ // uint64_t ticks() { return mach_absolute_time(); }
+ 
+ uint32_t current_thread_system_id() {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_SWITCH
++  static std::atomic<uint32_t> next_id{1};
++  thread_local uint32_t id = next_id.fetch_add(1);
++  return id;
++#elif defined(__APPLE__)
+   return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+ #else
+   return static_cast<uint32_t>(syscall(SYS_gettid));
+@@ -679,6 +699,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       pthread_attr_destroy(&attr);
+       return false;
+     }
++#if !REX_PLATFORM_SWITCH
+     if (params.initial_priority != 0) {
+       sched_param sched{};
+       sched.sched_priority = params.initial_priority + 1;
+@@ -691,6 +712,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+         return false;
+       }
+     }
++#endif
+     if (pthread_create(&thread_, &attr, ThreadStartRoutine, start_data) != 0) {
+       pthread_attr_destroy(&attr);
+       return false;
+@@ -742,6 +764,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+         std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
+         rex::string::copy_truncating(result.data(), android_pre_api_26_name_, result.size());
+       }
++#elif REX_PLATFORM_SWITCH
++      // newlib has no pthread_getname_np: no-op (name not stored).
+ #else
+       if (pthread_getname_np(thread_, result.data(), result.size() - 1) != 0) {
+         assert_always();
+@@ -760,6 +784,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       if (pthread_equal(thread_, pthread_self())) {
+         pthread_setname_np(std::string(name).c_str());
+       }
++#elif REX_PLATFORM_SWITCH
++      (void)name;  // newlib has no pthread_setname_np
+ #else
+       pthread_setname_np(thread_, std::string(name).c_str());
+ #endif
+@@ -783,12 +809,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ #if defined(__APPLE__)
+   uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
+ #else
+-  uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
++  uint32_t system_id() const { return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(thread_)); }
+ #endif
+ 
+   uint64_t affinity_mask() {
+     WaitStarted();
+-#if defined(__APPLE__)
++#if REX_PLATFORM_SWITCH
++    return 0xF;  // 4 application cores (core 3 is shared with the OS)
++#elif defined(__APPLE__)
+     // macOS doesn't expose Linux-style pthread affinity masks; report every
+     // logical processor as available.
+     auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
+@@ -819,7 +847,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   void set_affinity_mask(uint64_t mask) {
+     WaitStarted();
+-#if defined(__APPLE__)
++#if REX_PLATFORM_SWITCH
++    (void)mask;  // TODO(switch): svcSetThreadCoreMask
++#elif defined(__APPLE__)
+     // macOS doesn't expose Linux-style pthread affinity masks; keep this a
+     // no-op so higher layers can build and run.
+     (void)mask;
+@@ -845,6 +875,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   int priority() {
+     WaitStarted();
++#if REX_PLATFORM_SWITCH
++    return 0;
++#else
+     int policy;
+     sched_param param{};
+     int ret = pthread_getschedparam(thread_, &policy, &param);
+@@ -853,10 +886,15 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     }
+ 
+     return param.sched_priority;
++#endif
+   }
+ 
+   void set_priority(int new_priority) {
+     WaitStarted();
++#if REX_PLATFORM_SWITCH
++    (void)new_priority;  // TODO(switch): svcSetThreadPriority
++    return;
++#else
+     sched_param param{};
+     param.sched_priority = new_priority;
+     int result = pthread_setschedparam(thread_, SCHED_FIFO, &param);
+@@ -873,6 +911,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+           break;
+       }
+     }
++#endif
+   }
+ 
+   void QueueUserCallback(std::function<void()> callback) {
+@@ -892,7 +931,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       return;
+     }
+ 
+-#if defined(__APPLE__)
++#if REX_PLATFORM_SWITCH
++    // No signals on Horizon: alertable waits poll the queue (1 ms slices).
++    int result = 0;
++#elif defined(__APPLE__)
+     // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
+     // without the sigval payload.
+     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
+@@ -975,8 +1017,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       return true;
+     }
+ 
++#if REX_PLATFORM_SWITCH
++    // TODO(switch): preemptive suspend (svcSetThreadActivity). For now the
++    // target is only marked suspended; it blocks at its next suspend point.
++    return true;
++#else
+     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadSuspend));
+     return result == 0;
++#endif
+   }
+ 
+   void Terminate(int exit_code) {
+@@ -1007,7 +1055,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     if (is_current_thread) {
+       pthread_exit(reinterpret_cast<void*>(exit_code));
+     } else {
+-#if REX_PLATFORM_ANDROID
++#if REX_PLATFORM_SWITCH
++      // TODO(switch): cooperative termination only; no pthread_cancel/signals.
++#elif REX_PLATFORM_ANDROID
+       if (pthread_kill(thread_, GetSystemSignal(SignalType::kThreadTerminate)) != 0) {
+         assert_always();
+       }
+@@ -1533,7 +1583,9 @@ void Thread::Exit(int exit_code) {
+ }
+ 
+ void set_current_thread_name(const std::string_view name) {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_SWITCH
++  (void)name;
++#elif defined(__APPLE__)
+   pthread_setname_np(std::string(name).c_str());
+ #else
+   pthread_setname_np(pthread_self(), std::string(name).c_str());
+@@ -1545,6 +1597,7 @@ void set_current_thread_name(const std::string_view name) {
+ #endif
+ }
+ 
++#if !REX_PLATFORM_SWITCH
+ static void signal_handler(int signal, siginfo_t* /*info*/, void* /*context*/) {
+   switch (GetSystemSignalType(signal)) {
+     case SignalType::kThreadSuspend: {
+@@ -1566,5 +1619,6 @@ static void signal_handler(int signal, siginfo_t* /*info*/, void* /*context*/) {
+       assert_always();
+   }
+ }
++#endif  // !REX_PLATFORM_SWITCH
+ 
+ }  // namespace rex::thread
+-- 
+2.54.0
+

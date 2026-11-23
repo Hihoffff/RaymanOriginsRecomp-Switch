@@ -1,0 +1,354 @@
+From a9b819b7ed53ded611dcda88420d144c9d59fd8e Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Tue, 10 Nov 2026 00:54:55 +0300
+Subject: [PATCH] Switch: diagnostics for stalls (kstat, current-function
+ sampling, perf-guest), warning logged once
+
+---
+ include/rex/diag_sample.h                  | 23 ++++++++
+ src/graphics/null/null_gpu_switch.cpp      | 36 ++++++++++-
+ src/kernel/kstat.h                         | 69 ++++++++++++++++++++++
+ src/kernel/xboxkrnl/xboxkrnl_io.cpp        |  6 ++
+ src/kernel/xboxkrnl/xboxkrnl_io_info.cpp   |  4 ++
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp |  6 ++
+ src/system/xthread.cpp                     | 13 +++-
+ 7 files changed, 153 insertions(+), 4 deletions(-)
+ create mode 100644 include/rex/diag_sample.h
+ create mode 100644 src/kernel/kstat.h
+
+diff --git a/include/rex/diag_sample.h b/include/rex/diag_sample.h
+new file mode 100644
+index 0000000..8390fe5
+--- /dev/null
++++ b/include/rex/diag_sample.h
+@@ -0,0 +1,23 @@
++// Diagnostic (Switch bring-up): every guest function records its name in a
++// per-thread slot on entry; kstat.h dumps the slots, which shows where each
++// guest thread currently is (a poor man's sampling profiler).
++#pragma once
++#include <atomic>
++#include <cstdint>
++namespace rex_diag {
++uint32_t CurrentHandle();  // defined in xthread.cpp
++struct Slots {
++  const char* volatile fn[64];
++  uint32_t h[64];
++  std::atomic<int> n{0};
++};
++inline Slots g_slots;
++inline thread_local int t_slot = -1;
++inline void Mark(const char* f) {
++  if (t_slot < 0) {
++    t_slot = g_slots.n.fetch_add(1) % 64;
++    g_slots.h[t_slot] = CurrentHandle();
++  }
++  g_slots.fn[t_slot] = f;
++}
++}  // namespace rex_diag
+diff --git a/src/graphics/null/null_gpu_switch.cpp b/src/graphics/null/null_gpu_switch.cpp
+index 162a194..9deab1e 100644
+--- a/src/graphics/null/null_gpu_switch.cpp
++++ b/src/graphics/null/null_gpu_switch.cpp
+@@ -16,6 +16,8 @@
+ 
+ #include <rex/graphics/null_gpu.h>
+ 
++#include <chrono>
++#include <cstdint>
+ #include <memory>
+ #include <string>
+ 
+@@ -30,7 +32,23 @@ class SwitchNullCommandProcessor : public CommandProcessor {
+   SwitchNullCommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state)
+       : CommandProcessor(graphics_system, kernel_state) {}
+ 
+-  void IssueSwap(uint32_t, uint32_t, uint32_t) override {}
++  // Speed measurement for hardware runs: guest swaps, draws and copies per second.
++  void Tick() {
++    using clock = std::chrono::steady_clock;
++    auto now = clock::now();
++    if (!perf_start_.time_since_epoch().count()) perf_start_ = now;
++    double ms = std::chrono::duration<double, std::milli>(now - perf_start_).count();
++    if (ms >= 2000.0) {
++      REXGPU_INFO("[perf-guest] {:.1f} swaps/s, {:.0f} draws/s, {:.0f} copies/s (over {:.0f} ms)",
++                  swaps_ * 1000.0 / ms, draws_ * 1000.0 / ms, copies_ * 1000.0 / ms, ms);
++      perf_start_ = now;
++      swaps_ = draws_ = copies_ = 0;
++    }
++  }
++  void IssueSwap(uint32_t, uint32_t, uint32_t) override {
++    ++swaps_;
++    Tick();
++  }
+ 
+  protected:
+   bool SetupContext() override { return true; }
+@@ -38,8 +56,20 @@ class SwitchNullCommandProcessor : public CommandProcessor {
+   Shader* LoadShader(xenos::ShaderType, uint32_t, const uint32_t*, uint32_t) override {
+     return nullptr;
+   }
+-  bool IssueDraw(xenos::PrimitiveType, uint32_t, IndexBufferInfo*, bool) override { return true; }
+-  bool IssueCopy() override { return true; }
++  bool IssueDraw(xenos::PrimitiveType, uint32_t, IndexBufferInfo*, bool) override {
++    ++draws_;
++    Tick();
++    return true;
++  }
++  bool IssueCopy() override {
++    ++copies_;
++    Tick();
++    return true;
++  }
++
++ private:
++  std::chrono::steady_clock::time_point perf_start_{};
++  uint64_t swaps_ = 0, draws_ = 0, copies_ = 0;
+ };
+ 
+ class SwitchNullGraphicsSystem : public GraphicsSystem {
+diff --git a/src/kernel/kstat.h b/src/kernel/kstat.h
+new file mode 100644
+index 0000000..715db81
+--- /dev/null
++++ b/src/kernel/kstat.h
+@@ -0,0 +1,69 @@
++// Diagnostic: per-kernel-call counts and wall time, dumped every 5 s by whichever
++// thread notices (Switch bring-up: tells where the guest spends its time).
++#pragma once
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include <set>
++#include <rex/diag_sample.h>
++#include <rex/logging.h>
++#include <rex/system/xthread.h>
++
++namespace rex::kernel::kstat {
++struct Entry { uint64_t calls = 0; double ms = 0; };
++inline std::mutex& Mu() { static std::mutex m; return m; }
++inline std::map<std::string, Entry>& Tab() { static std::map<std::string, Entry> t; return t; }
++struct Active { std::string key; std::chrono::steady_clock::time_point t0; };
++inline std::map<const void*, Active>& Act() { static std::map<const void*, Active> a; return a; }
++inline std::string MakeKey(const char* n) {
++  auto* t = rex::system::XThread::GetCurrentThread();
++  return fmt::format("{}@{:08X}/t{:X}", n, t ? uint32_t(t->thread_state()->context()->lr) : 0u, t ? t->handle() : 0u);
++}
++inline std::chrono::steady_clock::time_point& Last() {
++  static auto t = std::chrono::steady_clock::now();
++  return t;
++}
++struct Scope {
++  std::string name;
++  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++  explicit Scope(const char* n) : name(MakeKey(n)) {
++    std::lock_guard<std::mutex> l(Mu());
++    Act()[this] = {name, t0};
++  }
++  ~Scope() {
++    auto now = std::chrono::steady_clock::now();
++    double ms = std::chrono::duration<double, std::milli>(now - t0).count();
++    std::lock_guard<std::mutex> l(Mu());
++    Act().erase(this);
++    auto& e = Tab()[name];
++    ++e.calls;
++    e.ms += ms;
++    if (now - Last() >= std::chrono::seconds(5)) {
++      Last() = now;
++      std::vector<std::pair<std::string, Entry>> v(Tab().begin(), Tab().end());
++      std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.calls > b.second.calls; });
++      std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.ms > b.second.ms; });
++      std::string s;
++      int n = 0;
++      for (auto& [k, x] : v) { if (++n > 14) break; s += fmt::format(" {}={}c/{:.0f}ms", k, x.calls, x.ms); }
++      REXKRNL_INFO("[kstat] top by time:{}", s);
++      std::string a;
++      for (auto& [p, ac] : Act()) {
++        double age = std::chrono::duration<double, std::milli>(now - ac.t0).count();
++        if (age > 1500) a += fmt::format(" {}={:.0f}ms", ac.key, age);
++      }
++      std::string w;
++      for (int i = 0; i < 64 && i < rex_diag::g_slots.n.load(); ++i)
++        w += fmt::format(" t{:X}={}", rex_diag::g_slots.h[i], rex_diag::g_slots.fn[i] ? rex_diag::g_slots.fn[i] : "?");
++      REXKRNL_INFO("[kstat] current guest function per thread:{}", w);
++      REXKRNL_INFO("[kstat] blocked >1.5s now:{}", a.empty() ? " (none)" : a);
++    }
++  }
++};
++}  // namespace rex::kernel::kstat
++#define KSTAT(name) ::rex::kernel::kstat::Scope _kstat_scope(name)
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index 3f1a852..dbe5774 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include "../kstat.h"
+ #include <rex/filesystem/device.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -105,6 +106,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, mapped_u64 allocation_size_ptr,
+                        u32 file_attributes, u32 share_access, u32 creation_disposition,
+                        u32 create_options) {
++  KSTAT("NtCreateFile");
+   // note used. maybe later
+   // uint64_t allocation_size = 0;  // is this correct???
+   // if (allocation_size_ptr) {
+@@ -179,6 +181,7 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
+ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+                      ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attributes,
+                      ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block, u32 open_options) {
++  KSTAT("NtOpenFile");
+   return NtCreateFile_entry(handle_out, desired_access, object_attributes, io_status_block, nullptr,
+                             0, 0, static_cast<uint32_t>(rex::filesystem::FileDisposition::kOpen),
+                             open_options);
+@@ -187,6 +190,7 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
+                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
++  KSTAT("NtReadFile");
+   uint64_t byte_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : 0;
+   const bool apc_requested = (static_cast<uint32_t>(apc_routine_ptr) & ~1u) != 0;
+   REXKRNL_IMPORT_TRACE(
+@@ -515,6 +519,7 @@ u32 NtRemoveIoCompletion_entry(u32 handle, mapped_u32 key_context, mapped_u32 ap
+ 
+ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
+                                     ppc_ptr_t<X_FILE_NETWORK_OPEN_INFORMATION> file_info) {
++  KSTAT("NtQueryFullAttributesFile");
+   auto object_name = REX_KERNEL_MEMORY()->TranslateVirtual<X_ANSI_STRING*>(obj_attribs->name_ptr);
+   auto path_str = util::TranslateAnsiPath(REX_KERNEL_MEMORY(), object_name);
+   REXKRNL_IMPORT_TRACE("NtQueryFullAttributesFile", "path={}", path_str);
+@@ -560,6 +565,7 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
+                                ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                                ppc_ptr_t<X_FILE_DIRECTORY_INFORMATION> file_info_ptr, u32 length,
+                                ppc_ptr_t<X_ANSI_STRING> file_name, u32 restart_scan) {
++  KSTAT("NtQueryDirectoryFile");
+   if (length < 72) {
+     return X_STATUS_INFO_LENGTH_MISMATCH;
+   }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+index bd5de65..831a933 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include "../kstat.h"
+ #include <rex/filesystem/device.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -106,6 +107,7 @@ uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
+ 
+ u32 NtQueryInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
+                                  mapped_void info_ptr, u32 info_length, u32 info_class) {
++  KSTAT("NtQueryInformationFile");
+   uint32_t minimum_length = GetQueryFileInfoMinimumLength(info_class);
+   if (!minimum_length) {
+     return X_STATUS_INVALID_INFO_CLASS;
+@@ -233,6 +235,7 @@ uint32_t GetSetFileInfoMinimumLength(uint32_t info_class) {
+ 
+ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                                mapped_void info_ptr, u32 info_length, u32 info_class) {
++  KSTAT("NtSetInformationFile");
+   uint32_t minimum_length = GetSetFileInfoMinimumLength(info_class);
+   if (!minimum_length) {
+     return X_STATUS_INVALID_INFO_CLASS;
+@@ -372,6 +375,7 @@ uint32_t GetQueryVolumeInfoMinimumLength(uint32_t info_class) {
+ u32 NtQueryVolumeInformationFile_entry(u32 file_handle,
+                                        ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr,
+                                        mapped_void info_ptr, u32 info_length, u32 info_class) {
++  KSTAT("NtQueryVolumeInformationFile");
+   uint32_t minimum_length = GetQueryVolumeInfoMinimumLength(info_class);
+   if (!minimum_length) {
+     return X_STATUS_INVALID_INFO_CLASS;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 25f1caf..55458e0 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include "../kstat.h"
+ #include <rex/cvar.h>
+ #include <algorithm>
+ #include <atomic>
+@@ -407,6 +408,7 @@ u32 KeQueryPerformanceFrequency_entry() {
+ }
+ 
+ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
++  KSTAT("KeDelayExecutionThread");
+   XThread* thread = XThread::GetCurrentThread();
+ 
+   if (alertable) {
+@@ -877,6 +879,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+ 
+ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
+                                 u32 alertable, mapped_u64 timeout_ptr) {
++  KSTAT("KeWaitForSingleObject");
+   KDIAG("KeWaitForSingleObject");
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
+@@ -892,6 +895,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
+ 
+ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
+                                   mapped_u64 timeout_ptr) {
++  KSTAT("NtWaitForSingleObjectEx");
+   KDIAG("NtWaitForSingleObjectEx");
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+@@ -916,6 +920,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
+                                    u32 wait_reason, u32 processor_mode, u32 alertable,
+                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
++  KSTAT("KeWaitForMultipleObjects");
+   KDIAG("KeWaitForMultipleObjects");
+   assert_true(wait_type <= 1);
+ 
+@@ -971,6 +976,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
+ 
+ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
+                                      u32 alertable, mapped_u64 timeout_ptr) {
++  KSTAT("NtWaitForMultipleObjectsEx");
+   KDIAG("NtWaitForMultipleObjectsEx");
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 0582ed8..e3f1531 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -943,7 +943,12 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+     }
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    // Logged once: the guest re-pins threads thousands of times per second and
++    // a log line each time (over nxlink) throttles the whole process.
++    static std::atomic<bool> warned{false};
++    if (!warned.exchange(true)) {
++      REXSYS_WARN("Too few processor cores - scheduling will be wonky (logged once)");
++    }
+   }
+ }
+ 
+@@ -1500,3 +1505,9 @@ void XHostThread::Execute() {
+ }
+ 
+ }  // namespace rex::system
++
++#include <rex/diag_sample.h>
++uint32_t rex_diag::CurrentHandle() {
++  auto* t = rex::system::XThread::GetCurrentThread();
++  return t ? t->handle() : 0u;
++}
+-- 
+2.54.0
+

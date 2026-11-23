@@ -1,0 +1,180 @@
+From 9bb19a7004720a9b670b9190db688f5c1705984e Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Sat, 14 Nov 2026 10:29:35 +0300
+Subject: [PATCH] Switch: read-only devices answer missing files from the
+ in-memory tree (host fallback cost ~85 ms per probe on SD); MMIO pump opt-in
+ (REX_MMIO_PUMP); diag: slow attribute queries, gpu-cp busy share, windowed
+ kstat
+
+---
+ src/filesystem/devices/host_path_device.cpp |  8 ++++++
+ src/graphics/command_processor.cpp          | 31 +++++++++++++++++++++
+ src/graphics/graphics_system.cpp            |  5 +++-
+ src/kernel/kstat.h                          | 18 +++++++++---
+ src/kernel/xboxkrnl/xboxkrnl_io.cpp         | 17 +++++++++++
+ 5 files changed, 74 insertions(+), 5 deletions(-)
+
+diff --git a/src/filesystem/devices/host_path_device.cpp b/src/filesystem/devices/host_path_device.cpp
+index f68b79a..5614f25 100644
+--- a/src/filesystem/devices/host_path_device.cpp
++++ b/src/filesystem/devices/host_path_device.cpp
+@@ -64,6 +64,14 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
+   if (resolved) {
+     return resolved;
+   }
++  // A read-only device was fully populated at Initialize() and GetChild()
++  // already matches case-insensitively: nothing can appear on the host that
++  // the tree does not hold. The host fallback below (stat + directory scan)
++  // cost ~85 ms per missing file on the Switch SD card, and games probe for
++  // optional files (patches, bundles) on every level transition.
++  if (read_only_) {
++    return nullptr;
++  }
+ 
+   // Fallback to a lazy case-insensitive host lookup when an entry is missing
+   // from the in-memory tree (for example because casing differs on Linux).
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 3260c00..969dd51 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -23,6 +23,9 @@
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
++#if REX_PLATFORM_SWITCH
++#include <switch.h>
++#endif
+ #include <chrono>
+ #include <atomic>
+ #include <thread>
+@@ -214,8 +217,36 @@ void CommandProcessor::WorkerThreadMain() {
+       fn();
+     }
+ 
++#if REX_PLATFORM_SWITCH
++    // DIAG: share of wall time the command processor is executing packets
++    // (not idling for new commands), plus its own CPU time, every 5 s.
++    static uint64_t diag_w0 = 0, diag_c0 = 0, diag_idle = 0;
++    {
++      uint64_t c = 0;
++      svcGetInfo(&c, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, UINT64_MAX);
++      const uint64_t w = armGetSystemTick();
++      if (!diag_w0) {
++        diag_w0 = w;
++        diag_c0 = c;
++      } else if (w - diag_w0 >= armGetSystemTickFreq() * 5) {
++        REXGPU_INFO("[cpu] gpu-cp busy {:.0f}% of wall, cpu {:.0f}% of a core",
++                    100.0 * double(w - diag_w0 - diag_idle) / double(w - diag_w0),
++                    100.0 * double(c - diag_c0) / double(w - diag_w0));
++        diag_w0 = w;
++        diag_c0 = c;
++        diag_idle = 0;
++      }
++    }
++#endif
+     uint32_t write_ptr_index = write_ptr_index_.load();
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
++#if REX_PLATFORM_SWITCH
++      const uint64_t diag_idle_t0 = armGetSystemTick();
++      struct IdleAcc {
++        uint64_t t0;
++        ~IdleAcc() { diag_idle += armGetSystemTick() - t0; }
++      } diag_idle_acc{diag_idle_t0};
++#endif
+       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+       // We've run out of commands to execute.
+       // We spin here waiting for new ones, as the overhead of waiting on our
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 9af4c64..1180f13 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
+@@ -149,7 +150,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+                                  reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
+                                  reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
+ #if REX_PLATFORM_SWITCH
+-  StartMmioPump();
++  // The pump forwarded 0 guest register writes in every Switch run (REX_MM_*
++  // handles the game's MMIO) but woke up every 200 us: opt-in only.
++  if (std::getenv("REX_MMIO_PUMP")) StartMmioPump();
+ #endif
+ 
+   // Guest vblank timer based on the configured guest video mode.
+diff --git a/src/kernel/kstat.h b/src/kernel/kstat.h
+index 9e7ef76..29a8b9a 100644
+--- a/src/kernel/kstat.h
++++ b/src/kernel/kstat.h
+@@ -45,13 +45,23 @@ struct Scope {
+     e.ms += ms;
+     if (now - Last() >= std::chrono::seconds(5)) {
+       Last() = now;
+-      std::vector<std::pair<std::string, Entry>> v(Tab().begin(), Tab().end());
+-      std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.calls > b.second.calls; });
++      // Windowed (reset every 5 s). Per-thread total wait; details only for
++      // threads that waited < 4.5 s of the 5 s window, i.e. did real work.
++      std::map<std::string, double> per_thread;
++      for (auto& [k, x] : Tab()) per_thread[k.substr(k.rfind('/') + 1)] += x.ms;
++      std::string totals;
++      for (auto& [t, ms] : per_thread)
++        if (ms < 4500) totals += fmt::format(" {}={:.0f}ms", t, ms);
++      REXKRNL_INFO("[kstat] busy threads, wait ms in 5 s:{}", totals.empty() ? " (none)" : totals);
++      std::vector<std::pair<std::string, Entry>> v;
++      for (auto& [k, x] : Tab())
++        if (per_thread[k.substr(k.rfind('/') + 1)] < 4500) v.emplace_back(k, x);
+       std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.ms > b.second.ms; });
+       std::string s;
+       int n = 0;
+-      for (auto& [k, x] : v) { if (++n > 14) break; s += fmt::format(" {}={}c/{:.0f}ms", k, x.calls, x.ms); }
+-      REXKRNL_INFO("[kstat] top by time:{}", s);
++      for (auto& [k, x] : v) { if (++n > 16) break; s += fmt::format(" {}={}c/{:.0f}ms", k, x.calls, x.ms); }
++      REXKRNL_INFO("[kstat] busy-thread waits:{}", s);
++      Tab().clear();
+       std::string a;
+       for (auto& [p, ac] : Act()) {
+         double age = std::chrono::duration<double, std::milli>(now - ac.t0).count();
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index e4f20b6..d6767c4 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -13,6 +13,8 @@
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ #include "../kstat.h"
++#include <chrono>
++#include <atomic>
+ #include <rex/filesystem/device.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -548,7 +550,22 @@ u32 NtQueryFullAttributesFile_entry(ppc_ptr_t<X_OBJECT_ATTRIBUTES> obj_attribs,
+   }
+ 
+   // Resolve the file using the virtual file system.
++#if REX_PLATFORM_SWITCH
++  const auto diag_t0 = std::chrono::steady_clock::now();
++#endif
+   auto entry = REX_KERNEL_FS()->ResolvePath(target_path);
++#if REX_PLATFORM_SWITCH
++  {
++    // DIAG: slow attribute queries (SD card) and which paths they hit.
++    const double ms =
++        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - diag_t0).count();
++    static std::atomic<int> logged{0};
++    if (ms > 5.0 && logged.fetch_add(1) < 30) {
++      REXKRNL_INFO("[fsdiag] NtQueryFullAttributesFile '{}' {} in {:.1f} ms", target_path,
++                   entry ? "found" : "MISSING", ms);
++    }
++  }
++#endif
+   if (entry) {
+     // Found.
+     file_info->creation_time = entry->create_timestamp();
+-- 
+2.54.0
+

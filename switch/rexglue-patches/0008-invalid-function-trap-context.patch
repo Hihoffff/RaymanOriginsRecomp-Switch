@@ -1,0 +1,283 @@
+From 8cbe73e2c10c0847c4cfc0cdac3853aa8b41cfda Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 22:02:39 +0300
+Subject: [PATCH 1/6] InvalidFunctionTrap: print lr/r1/r3/r4/ctr for
+ diagnostics
+
+---
+ src/system/function_dispatcher.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index bd43109..7fb663e 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -35,8 +35,11 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ }  // namespace
+ 
+ static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
+-  REX_FATAL("Call to invalid or unregistered function at guest address 0x{:08X}",
+-            ctx.last_indirect_target);
++  REX_FATAL(
++      "Call to invalid or unregistered function at guest address 0x{:08X} "
++      "(lr=0x{:08X} r1=0x{:08X} r3=0x{:08X} r4=0x{:08X} ctr=0x{:08X})",
++      ctx.last_indirect_target, static_cast<uint32_t>(ctx.lr), ctx.r1.u32, ctx.r3.u32, ctx.r4.u32,
++      ctx.ctr.u32);
+ }
+ 
+ PPCFunc* ResolveIndirectFunction(uint32_t guest_address) {
+-- 
+2.54.0
+
+
+From 4d424fa3fece38b03523075772b04abeb5985ae3 Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 22:04:31 +0300
+Subject: [PATCH 2/6] InvalidFunctionTrap: guest stack scan
+
+---
+ src/system/function_dispatcher.cpp | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/function_dispatcher.cpp b/src/system/function_dispatcher.cpp
+index 7fb663e..9ffa920 100644
+--- a/src/system/function_dispatcher.cpp
++++ b/src/system/function_dispatcher.cpp
+@@ -13,6 +13,9 @@
+  *              role as a function dispatch table rather than a CPU emulator.
+  */
+ 
++#include <cstring>
++#include <string>
++
+ #include <rex/assert.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+@@ -34,7 +37,23 @@ FunctionDispatcher* GetBoundFunctionDispatcher() {
+ 
+ }  // namespace
+ 
+-static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* /*base*/) {
++static void InvalidFunctionTrap(PPCContext& ctx, uint8_t* base) {
++  // Diagnostic: scan the guest stack for words that look like code addresses
++  // (poor man's backtrace) and print them before the fatal message.
++  {
++    std::string hits;
++    int found = 0;
++    for (uint32_t i = 0; i < 1024 && found < 24; ++i) {
++      uint32_t raw;
++      std::memcpy(&raw, base + ctx.r1.u32 + 4 * i, sizeof(raw));
++      uint32_t v = __builtin_bswap32(raw);
++      if (v >= 0x82120000u && v <= 0x829849B4u && (v & 3) == 0) {
++        hits += fmt::format(" {:08X}@+{:X}", v, 4 * i);
++        ++found;
++      }
++    }
++    REXLOG_CRITICAL("guest stack scan (code-like words):{}", hits);
++  }
+   REX_FATAL(
+       "Call to invalid or unregistered function at guest address 0x{:08X} "
+       "(lr=0x{:08X} r1=0x{:08X} r3=0x{:08X} r4=0x{:08X} ctr=0x{:08X})",
+-- 
+2.54.0
+
+
+From 82bcfc5cc1899412f25d69ca3528393771917d74 Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 22:07:33 +0300
+Subject: [PATCH 3/6] ExCreateThread: info log of start/context/flags
+ (diagnostic)
+
+---
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..3118ba1 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -122,6 +122,10 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
+   // LPVOID   StartContext,
+   // DWORD    CreationFlags // 0x80?
+ 
++  REXKRNL_INFO("[thread-diag] ExCreateThread start={:08X} context={:08X} flags={:X} stack={:X}",
++               start_address.guest_address(), start_context.guest_address(),
++               (uint32_t)creation_flags, (uint32_t)stack_size);
++
+   // Determine target process based on creation flags.
+   uint32_t guest_process = REX_KERNEL_STATE()->GetTitleProcess();
+   if (creation_flags & 2) {
+-- 
+2.54.0
+
+
+From 59732f790aad060ab10835559b0b6bccf42b75db Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 22:12:55 +0300
+Subject: [PATCH 4/6] Thread diagnostics: dump start context words at create
+ and execute
+
+---
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp | 16 +++++++++++++---
+ src/system/xthread.cpp                     | 14 ++++++++++++++
+ 2 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 3118ba1..2ec997b 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -122,9 +122,19 @@ u32 ExCreateThread_entry(mapped_u32 handle_ptr, u32 stack_size, mapped_u32 threa
+   // LPVOID   StartContext,
+   // DWORD    CreationFlags // 0x80?
+ 
+-  REXKRNL_INFO("[thread-diag] ExCreateThread start={:08X} context={:08X} flags={:X} stack={:X}",
+-               start_address.guest_address(), start_context.guest_address(),
+-               (uint32_t)creation_flags, (uint32_t)stack_size);
++  {
++    std::string w;
++    if (start_context.guest_address()) {
++      auto* p = REX_KERNEL_STATE()->memory()->TranslateVirtual(start_context.guest_address());
++      for (int i = 0; i < 8; ++i) {
++        w += fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(p + 4 * i));
++      }
++    }
++    REXKRNL_INFO(
++        "[thread-diag] ExCreateThread start={:08X} context={:08X} flags={:X} stack={:X} words:{}",
++        start_address.guest_address(), start_context.guest_address(), (uint32_t)creation_flags,
++        (uint32_t)stack_size, w);
++  }
+ 
+   // Determine target process based on creation flags.
+   uint32_t guest_process = REX_KERNEL_STATE()->GetTitleProcess();
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..8397b9a 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -597,6 +597,20 @@ void XThread::Execute() {
+     want_exit_code = true;
+   }
+ 
++  {
++    // Diagnostic (Switch bring-up): dump the start context as the thread begins.
++    uint32_t c = creation_params_.start_context;
++    std::string w;
++    if (c) {
++      auto* p = memory()->TranslateVirtual(c);
++      for (int i = 0; i < 8; ++i) {
++        w += fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(p + 4 * i));
++      }
++    }
++    REXSYS_INFO("[thread-diag] Execute handle={:08X} start={:08X} ctx={:08X} words:{}", handle(),
++                address, c, w);
++  }
++
+   // NOTE(tomc): JIT execution replaced with direct function calls
+   // In rexglue, guest code is compiled ahead of time and called directly.
+   // The start_address points to a 32bit guest address, for which the function
+-- 
+2.54.0
+
+
+From ae3fc269fa0d0c652d097c2fa18a48fc1d4d3f6c Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 22:16:04 +0300
+Subject: [PATCH 5/6] Thread diagnostics: dump memory pointed to by context,
+ log resume calls
+
+---
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp |  2 ++
+ src/system/xthread.cpp                     | 13 +++++++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 2ec997b..aa4373f 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -197,6 +197,7 @@ u32 NtResumeThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
+   if (thread) {
+     REXKRNL_TRACE("[NtResumeThread] handle={:08X} thread={}", uint32_t(handle), thread->name());
+     result = thread->Resume(&suspend_count);
++    REXKRNL_INFO("[thread-diag] NtResumeThread handle={:08X} prev_count={}", uint32_t(handle), suspend_count);
+   } else {
+     REXKRNL_WARN("[NtResumeThread] handle={:08X} NOT FOUND", uint32_t(handle));
+   }
+@@ -215,6 +216,7 @@ u32 KeResumeThread_entry(mapped_void thread_ptr) {
+     REXKRNL_TRACE("[KeResumeThread] ptr={:08X} thread={}", thread_ptr.guest_address(),
+                   thread->name());
+     result = thread->Resume();
++    REXKRNL_INFO("[thread-diag] KeResumeThread ptr={:08X}", thread_ptr.guest_address());
+   } else {
+     REXKRNL_WARN("[KeResumeThread] ptr={:08X} NOT FOUND", thread_ptr.guest_address());
+     result = X_STATUS_INVALID_HANDLE;
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 8397b9a..9392da5 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -609,6 +609,19 @@ void XThread::Execute() {
+     }
+     REXSYS_INFO("[thread-diag] Execute handle={:08X} start={:08X} ctx={:08X} words:{}", handle(),
+                 address, c, w);
++    if (c) {
++      auto* cp = memory()->TranslateVirtual(c);
++      for (int k = 3; k <= 5; ++k) {
++        uint32_t q = memory::load_and_swap<uint32_t>(cp + 4 * k);
++        if (q < 0x10000 || q > 0xBFFF0000) continue;
++        auto* qp = memory()->TranslateVirtual(q);
++        std::string d;
++        for (int i = 0; i < 12; ++i) {
++          d += fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(qp + 4 * i));
++        }
++        REXSYS_INFO("[thread-diag]   ctx[{}]={:08X} ->{}", k, q, d);
++      }
++    }
+   }
+ 
+   // NOTE(tomc): JIT execution replaced with direct function calls
+-- 
+2.54.0
+
+
+From 84dd2e9a7eae27b5598e74336010d7f3d496fa8c Mon Sep 17 00:00:00 2001
+From: hihoffff <hihoffff@example.invalid>
+Date: Mon, 9 Nov 2026 22:26:56 +0300
+Subject: [PATCH 6/6] Thread diagnostics: vtable/field dumps, resume logging
+
+---
+ src/system/xthread.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 9392da5..0582ed8 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -1,3 +1,7 @@
++#include <cstdlib>
++#include <chrono>
++#include <thread>
++#include <filesystem>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -611,6 +615,19 @@ void XThread::Execute() {
+                 address, c, w);
+     if (c) {
+       auto* cp = memory()->TranslateVirtual(c);
++      {
++        uint32_t vt = memory::load_and_swap<uint32_t>(cp);
++        if (vt >= 0x10000 && vt < 0xBFFF0000) {
++          auto* vp = memory()->TranslateVirtual(vt);
++          std::string d;
++          for (int i = 0; i < 8; ++i) d += fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(vp + 4 * i));
++          REXSYS_INFO("[thread-diag]   vtable {:08X} ->{}", vt, d);
++        }
++        std::string d2;
++        for (int i = 15; i <= 18; ++i) d2 += fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(cp + 4 * i));
++        REXSYS_INFO("[thread-diag]   ctx+60..72:{}  ctx+156={:08X} ctx+628={:08X}", d2,
++                    memory::load_and_swap<uint32_t>(cp + 156), memory::load_and_swap<uint32_t>(cp + 628));
++      }
+       for (int k = 3; k <= 5; ++k) {
+         uint32_t q = memory::load_and_swap<uint32_t>(cp + 4 * k);
+         if (q < 0x10000 || q > 0xBFFF0000) continue;
+-- 
+2.54.0
+
