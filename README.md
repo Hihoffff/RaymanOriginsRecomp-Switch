@@ -6,7 +6,11 @@ The build translates the game's PowerPC code for the Switch's ARM64 CPU.
 ReXGlue provides the runtime, and a Vulkan renderer using NVK draws the game
 on the console. This project is independent of Ubisoft and Nintendo.
 
-[Build the port](#build-the-port) · [Install on Switch](#install-on-switch) · [Project status](#project-status) · [Credits and license](#credits-and-license)
+![Rayman Origins title screen in a jungle clearing](media/title-screen.png)
+
+*Title screen*
+
+[Build the port](#build-the-port) · [Install on Switch](#install-on-switch) · [Project status](#project-status) · [Screenshots](#screenshots) · [Credits and license](#credits-and-license)
 
 > [!IMPORTANT]
 > You'll need a legally obtained Xbox 360 copy of Rayman Origins. The game
@@ -69,6 +73,12 @@ This source preview includes a candidate fix for rare texture corruption
 after extended play. The fix passed a local regression test. An extended
 Switch run is still pending.
 
+## Screenshots
+
+![Rayman Origins world map showing a route across the jungle](media/world-map.png)
+
+*World map*
+
 ## Credits and license
 
 - [XDanfr/RaymanOriginsRecomp](https://github.com/XDanfr/RaymanOriginsRecomp)
@@ -78,5 +88,7 @@ Switch run is still pending.
   The work includes ReXGlue and NVK integration, input, audio, saves, and
   renderer fixes.
 
-The port is licensed under the [GNU GPL v3](LICENSE). See the
+The port's source code is licensed under the [GNU GPL v3](LICENSE). See the
 [third-party notices](THIRD_PARTY_NOTICES.md) for upstream and dependency terms.
+
+Game imagery © Ubisoft Entertainment.
