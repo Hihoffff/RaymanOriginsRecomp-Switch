@@ -18,35 +18,33 @@ on the console. This project is independent of Ubisoft and Nintendo.
 
 ## Build the port
 
-1. **Prepare your game dump.** The current Switch hooks target the retail
-   revision whose `default.xex` SHA-256 starts with `53533ae1`. Compare the full
-   hash in the [build guide](switch/README.md#prepare-the-upstream-code-and-your-game-dump)
-   before building. If your dump is in Xbox 360 GOD format, use the included
-   [extraction tool](tools/god_extract.py) to unpack it.
-2. **Generate the game code and shaders.** Follow the
-   [code generation steps](switch/README.md#generate-game-code-and-shaders-locally)
-   for ReXGlue and SPIR-V. Keep the original directory structure of the dump.
-3. **Build the NRO.** Set up ReXGlue and NVK, then follow the
-   [Docker build commands](switch/README.md#build-the-switch-runtime-and-nro).
-   The build produces `switch/game/build/rayman_switch.nro`.
+1. **Set up Docker and the dependencies.** Follow the
+   [Switch build guide](switch/README.md#build-with-docker) for the one-time
+   setup. On Windows, open an integrated WSL2 terminal.
+2. **Prepare your game dump.** Put your own extracted Xbox 360 game files
+   in `private/game/`. Compare the SHA-256 of `default.xex` with the hash
+   in the build guide. For a GOD dump, use the
+   [extraction tool](tools/god_extract.py).
+3. **Build the NRO and SD files.** Run:
 
-The NRO build was verified on Apple Silicon macOS with Docker and devkitA64.
-A full build from a fresh clone is still pending verification. The shader
-preparation script currently selects macOS ARM64 DXC, so the end-to-end
-workflow on other hosts is unverified.
+   ```sh
+   bash switch/build.sh
+   ```
+
+   Docker generates the code and shaders and builds the NRO. The script
+   prints the path to your local SD card files under `private/build-docker/`.
+
+The full workflow was verified with x86-64 containers on Apple Silicon.
+A fresh dependency setup, native Linux and Windows/WSL2 runs, and a Switch
+run of the resulting NRO remain to be verified.
 
 ## Install on Switch
 
-You'll need a Switch running Atmosphère and set up to launch homebrew in
-full-memory mode.
-
-1. Create `switch/RaymanOriginsRecomp/` on the SD card.
-2. Copy `rayman_switch.nro` into that folder and your extracted game files
-   into its `game/` subfolder. Place `default.xex` directly inside `game/`.
-3. Copy your generated `.spv` files into `native/spirv_ubo/` within the same
-   port folder.
-4. Open the Homebrew Menu in **full-memory application mode** and launch
-   Rayman Origins.
+1. Back up any existing saves.
+2. Copy the `switch/` folder from the build's `sd/` folder to the root of
+   your SD card.
+3. On a Switch running Atmosphère, open the Homebrew Menu in **full-memory
+   application mode** and launch Rayman Origins.
 
 The SD card should be laid out like this:
 

@@ -20,6 +20,11 @@ if [ $# -eq 0 ]; then
   exit 2
 fi
 
-docker run --rm --platform linux/arm64 \
+platform=${DEVKITA64_PLATFORM:-linux/arm64}
+args=(run --rm)
+if [ "$platform" != native ]; then
+  args+=(--platform "$platform")
+fi
+docker "${args[@]}" \
   -v "$REPO_ROOT":/work -w /work \
   "$IMAGE" bash -c "source /opt/devkitpro/switchvars.sh && $*"
